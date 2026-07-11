@@ -26,11 +26,11 @@ class EncryptedDataSource(
     private var opened = false
     private var currentPosition: Long = 0
     private var bytesRemaining: Long = 0
-    
-    private val fileNonce = ByteArray(12)
-    private var encryptedFileSize: Long = 0
 
-    // Cache of the most recently decrypted block to optimize sequential sub-block reads from ExoPlayer
+    private val fileNonce = ByteArray(12)
+    private var fullTierEncryptedSize: Long = 0
+    private var offsetFull: Long = 0
+
     private var cachedBlockIndex: Long = -1
     private var cachedBlockData: ByteArray? = null
 
@@ -40,32 +40,52 @@ class EncryptedDataSource(
         val uri = dataSpec.uri
 
         pfd = context.contentResolver.openFileDescriptor(uri, "r")
-            ?: throw IOException("Failed to open file descriptor for: $uri")
+            ?: throw IOException("Failed to open file descriptor")
         val fileInputStream = FileInputStream(pfd!!.fileDescriptor)
         fileChannel = fileInputStream.channel
-        encryptedFileSize = fileChannel!!.size()
+        val totalFileSize = fileChannel!!.size()
 
-        if (encryptedFileSize < 12) {
-            throw IOException("Malformed encrypted file: file too small")
-        }
+        if (totalFileSize < 96) throw IOException("File too small to be SGV2")
 
-        // Read 12-byte header file nonce
-        val headerBuffer = ByteBuffer.allocate(12)
+        // Parse SGV2 Header to find Tier 3 (Full) Offset
+        val headerBuffer = ByteBuffer.allocate(96)
         fileChannel!!.read(headerBuffer, 0)
         headerBuffer.flip()
-        headerBuffer.get(fileNonce)
 
-        // Reset decrypt cache
+        val magic = ByteArray(4)
+        headerBuffer.get(magic)
+        if (!magic.contentEquals(CryptoEngine.SGV2_MAGIC)) throw IOException("Not an SGV2 format")
+
+        val headerNonce = ByteArray(12)
+        headerBuffer.get(headerNonce)
+        val headerCipher = ByteArray(80)
+        headerBuffer.get(headerCipher)
+
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(128, headerNonce))
+        val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
+        val thumbLen = headerPlain.long
+        val screenLen = headerPlain.long
+        offsetFull = 96L + thumbLen + screenLen
+
+        fullTierEncryptedSize = totalFileSize - offsetFull
+
+        // Đọc Nonce của Tier 3 tại offsetFull
+        val nonceBuffer = ByteBuffer.allocate(12)
+        fileChannel!!.read(nonceBuffer, offsetFull)
+        nonceBuffer.flip()
+        nonceBuffer.get(fileNonce)
+
         cachedBlockIndex = -1
         cachedBlockData = null
 
         currentPosition = dataSpec.position
-        val decryptedLength = CryptoEngine.getDecryptedLength(encryptedFileSize)
+        val decryptedLength = CryptoEngine.getDecryptedLength(fullTierEncryptedSize)
 
-        if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-            bytesRemaining = dataSpec.length
+        bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+            dataSpec.length
         } else {
-            bytesRemaining = decryptedLength - currentPosition
+            decryptedLength - currentPosition
         }
 
         opened = true
@@ -74,84 +94,59 @@ class EncryptedDataSource(
     }
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
-        if (length == 0) {
-            return 0
-        }
-        if (bytesRemaining == 0L) {
-            return C.RESULT_END_OF_INPUT
-        }
+        if (length == 0) return 0
+        if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
 
         val toRead = minOf(length.toLong(), bytesRemaining).toInt()
-        
-        // Block-based index calculation
         val blockIndex = currentPosition / 4096
         val blockOffset = (currentPosition % 4096).toInt()
         val blockRemaining = 4096 - blockOffset
         val bytesFromThisBlock = minOf(toRead, blockRemaining)
 
         val decryptedBlock = getOrDecryptBlock(blockIndex)
-        if (decryptedBlock == null || decryptedBlock.isEmpty()) {
-            return C.RESULT_END_OF_INPUT
-        }
+        if (decryptedBlock == null || decryptedBlock.isEmpty()) return C.RESULT_END_OF_INPUT
 
         val actualToCopy = minOf(bytesFromThisBlock, decryptedBlock.size - blockOffset)
-        if (actualToCopy <= 0) {
-            return C.RESULT_END_OF_INPUT
-        }
+        if (actualToCopy <= 0) return C.RESULT_END_OF_INPUT
 
         System.arraycopy(decryptedBlock, blockOffset, buffer, offset, actualToCopy)
 
         currentPosition += actualToCopy
         bytesRemaining -= actualToCopy
         bytesTransferred(actualToCopy)
-        
+
         return actualToCopy
     }
 
     private fun getOrDecryptBlock(blockIndex: Long): ByteArray? {
-        if (blockIndex == cachedBlockIndex && cachedBlockData != null) {
-            return cachedBlockData
-        }
+        if (blockIndex == cachedBlockIndex && cachedBlockData != null) return cachedBlockData
 
-        val encryptedBlockStart = 12 + blockIndex * 4112
-        if (encryptedBlockStart >= encryptedFileSize) {
-            return null
-        }
+        // Start tính từ offsetFull, bỏ qua 12 byte Nonce của Full tier
+        val encryptedBlockStart = offsetFull + 12 + blockIndex * 4112
+        if (encryptedBlockStart >= offsetFull + fullTierEncryptedSize) return null
 
-        val encryptedBlockSize = minOf(4112, encryptedFileSize - encryptedBlockStart)
-        if (encryptedBlockSize <= 16) {
-            return null
-        }
+        val encryptedBlockSize = minOf(4112, offsetFull + fullTierEncryptedSize - encryptedBlockStart)
+        if (encryptedBlockSize <= 16) return null
 
         val byteBuffer = ByteBuffer.allocate(encryptedBlockSize.toInt())
         var bytesRead = 0
         while (bytesRead < encryptedBlockSize) {
             val count = fileChannel!!.read(byteBuffer, encryptedBlockStart + bytesRead)
-            if (count == -1) {
-                break
-            }
+            if (count == -1) break
             bytesRead += count
         }
 
-        if (bytesRead <= 16) {
-            return null
-        }
+        if (bytesRead <= 16) return null
 
         return try {
             val blockIv = CryptoEngine.calculateBlockIv(fileNonce, blockIndex)
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            val keySpec = SecretKeySpec(dek, "AES")
-            val gcmSpec = GCMParameterSpec(128, blockIv)
-            cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec)
-
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(128, blockIv))
             val decrypted = cipher.doFinal(byteBuffer.array(), 0, bytesRead)
-            
             cachedBlockIndex = blockIndex
             cachedBlockData = decrypted
             decrypted
-        } catch (e: Exception) {
-            null
-        }
+        } catch (e: Exception) { null }
     }
 
     override fun getUri(): Uri? = dataSpec?.uri
@@ -161,11 +156,8 @@ class EncryptedDataSource(
             opened = false
             transferEnded()
         }
-        try {
-            pfd?.close()
-        } catch (e: IOException) {
-            // Ignore
-        } finally {
+        try { pfd?.close() } catch (e: IOException) {}
+        finally {
             pfd = null
             fileChannel = null
             cachedBlockIndex = -1

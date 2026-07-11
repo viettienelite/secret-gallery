@@ -118,17 +118,95 @@ import coil.ImageLoader
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import com.example.coil.EncryptedUriFetcher
-import com.example.crypto.BlockDecryptingInputStream
+import com.example.crypto.CryptoEngine
 import com.example.media.EncryptedDataSourceFactory
 import com.example.ui.VaultItem
 import com.example.ui.VaultViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import coil.size.Size as CoilSize
+
+// ------------------------------------------------------------------------------------
+// CACHE BITMAP TIER "FULL" - RIÊNG THEO TỪNG ITEM (encryptedName).
+//
+// TẠI SAO CẦN: trước đây MediaViewerScreen giữ 1 biến state DÙNG CHUNG duy nhất
+// (fullImageBitmap) đại diện cho "trang hiện tại", rồi truyền xuống HorizontalPager dựa theo
+// cờ isCurrentPage. Vấn đề là pagerState.currentPage đổi NGAY khi vuốt xong, nhưng biến state
+// kia chỉ được reset/tải lại ở nhịp sau đó (trong 1 LaunchedEffect(currentItem, dek) chạy bất
+// đồng bộ) -> có đúng 1-2 frame mà "trang mới" bị gắn nhầm bitmap FULL của "trang cũ" (khác tỉ
+// lệ khung hình) => nháy/bóng ma ảnh cũ, đôi lúc trông như ảnh bị cắt cụt/đen ở mép dưới do
+// lệch aspect ratio đúng trong khoảnh khắc đó.
+//
+// FIX: mỗi trang trong pager (EncryptedImageViewer) tự tải và tự cache bitmap FULL của CHÍNH
+// item đó, key theo encryptedName - không còn phụ thuộc "trang nào đang là current" nữa nên
+// không thể lẫn dữ liệu giữa các trang. Cache nhỏ (LRU) để: (1) quay lại trang đã xem hiện
+// ngay lập tức, (2) tận dụng beyondViewportPageCount = 1 để "mồi" trước ảnh full của trang kế
+// bên trong lúc user còn đang xem trang hiện tại -> lúc vuốt sang gần như không còn độ trễ nào.
+// ------------------------------------------------------------------------------------
+object FullBitmapCache {
+    // Bitmap full-size khá nặng, chỉ giữ đủ cho trang hiện tại + vài trang lân cận
+    // (khớp với beyondViewportPageCount = 1 của HorizontalPager) để tránh tốn RAM.
+    private const val MAX_ENTRIES = 4
+    private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
+        MAX_ENTRIES, 0.75f, true
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, androidx.compose.ui.graphics.ImageBitmap>?
+        ): Boolean = size > MAX_ENTRIES
+    }
+
+    @Synchronized
+    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache[key]
+
+    @Synchronized
+    fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
+        cache[key] = bitmap
+    }
+}
+
+// ------------------------------------------------------------------------------------
+// CACHE BITMAP TIER "SCREEN" - RIÊNG THEO TỪNG ITEM (encryptedName).
+//
+// Nguyên nhân gây bóng ma/nháy ảnh cũ khi vuốt trang: `screenImageBitmap` ở cấp
+// MediaViewerScreen là 1 BIẾN STATE DÙNG CHUNG duy nhất, trước đây được gate bằng điều kiện
+// `isCurrentPage` để dùng làm placeholder cho trang trong Pager - Y HỆT lỗi kiến trúc mà comment
+// đầu file mô tả đã xảy ra với Tier FULL và đã được fix bằng FullBitmapCache.
+//
+// Cơ chế chính xác: pagerState.currentPage đổi NGAY khi vuốt xong, nhưng LaunchedEffect
+// (currentItem, dek) ở cấp màn hình (nạp lại Tier SCREEN) chỉ bắt đầu chạy SAU đó (bất đồng bộ,
+// chạy ở nhịp kế tiếp). Kết quả: có ĐÚNG 1 khung hình mà `isCurrentPage` đã = true cho trang MỚI,
+// nhưng `screenImageBitmap` vẫn còn giữ bitmap Tier SCREEN của trang CŨ - nếu điều kiện gate chỉ
+// dựa vào isCurrentPage (không kiểm tra bitmap đó THỰC SỰ thuộc về item nào), trang mới sẽ bị
+// gán NHẦM ảnh của trang cũ làm nền/placeholder trong đúng khung hình đó.
+//
+// FIX: (1) cache Tier SCREEN riêng theo TỪNG item (encryptedName) y hệt FullBitmapCache, để mỗi
+// trang có thể tự tra cứu ĐÚNG bitmap của CHÍNH NÓ bất kể biến state dùng chung đang ở trạng thái
+// nào. (2) thêm "owner tag" (screenImageBitmapOwner) đi kèm biến screenImageBitmap dùng chung, để
+// nếu vẫn cần đọc trực tiếp biến đó (cho animation Canvas mở/đóng) thì luôn xác nhận đúng chủ sở
+// hữu trước khi dùng, không bao giờ gate chỉ bằng isCurrentPage nữa.
+// ------------------------------------------------------------------------------------
+object ScreenBitmapCache {
+    private const val MAX_ENTRIES = 4
+    private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
+        MAX_ENTRIES, 0.75f, true
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<String, androidx.compose.ui.graphics.ImageBitmap>?
+        ): Boolean = size > MAX_ENTRIES
+    }
+
+    @Synchronized
+    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache[key]
+
+    @Synchronized
+    fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
+        cache[key] = bitmap
+    }
+}
 
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
@@ -160,7 +238,6 @@ fun MediaViewerScreen(
                 attrs.dimAmount = 0f
                 attrs.windowAnimations = 0
 
-                // ÉP 120HZ: tìm mode cùng độ phân giải hiện tại nhưng refresh rate cao nhất
                 try {
                     val display = w.windowManager.defaultDisplay
                     val currentMode = display.mode
@@ -181,7 +258,6 @@ fun MediaViewerScreen(
                 w.attributes = attrs
                 w.setBackgroundDrawableResource(android.R.color.transparent)
 
-                // API 34+: báo thẳng cho hệ thống view này cần frame rate cao
                 if (android.os.Build.VERSION.SDK_INT >= 34) {
                     w.decorView.requestedFrameRate = android.view.View.REQUESTED_FRAME_RATE_CATEGORY_HIGH
                 }
@@ -210,14 +286,17 @@ fun MediaViewerScreen(
         var keepPagerAlive by remember { mutableStateOf(false) }
 
         val progress = remember { Animatable(0f) }
-        val fullImageAlpha = remember { Animatable(0f) }
-        // Alpha riêng cho lúc ĐÓNG (zoom-out): ảnh/video full chất lượng sẽ fade dần
-        // về 0 để lộ ảnh thumb (đã opaque sẵn) bên dưới trong lúc khung hình thu nhỏ.
-        val closeFullQualityAlpha = remember { Animatable(1f) }
+        val closeTransitionAlpha = remember { Animatable(1f) }
 
+        // Lưu ý: thumbImageBitmap/screenImageBitmap dưới đây phục vụ animation mở/đóng (Canvas
+        // shared-element ở cuối file). screenImageBitmap CŨNG được dùng làm placeholder cho
+        // Pager (xem bestPlaceholder bên dưới) - nhưng để làm vậy AN TOÀN (không dính bóng ma z-
+        // axis khi vuốt), PHẢI đi kèm screenImageBitmapOwner để xác nhận đúng chủ sở hữu trước
+        // khi dùng, KHÔNG được gate chỉ bằng isCurrentPage (xem ScreenBitmapCache ở đầu file).
         var thumbImageBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-        var fullImageBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-        var isDecodingFullFailed by remember { mutableStateOf(false) }
+        var screenImageBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+        var screenImageBitmapOwner by remember { mutableStateOf<String?>(null) }
+        val screenImageAlpha = remember { Animatable(0f) }
         var thumbReady by remember { mutableStateOf(false) }
 
         var originalWidth by remember {
@@ -252,30 +331,30 @@ fun MediaViewerScreen(
         val pagerState = rememberPagerState(initialPage = initialIndex, pageCount = { items.size })
         val currentItem = items.getOrNull(pagerState.currentPage) ?: item
 
+        var isHdrActive by remember { mutableStateOf(false) }
+        var isVideoReadyForHdr by remember { mutableStateOf(false) }
+        var isImageReadyForHdr by remember { mutableStateOf(false) }
+
+        LaunchedEffect(currentItem) {
+            isVideoReadyForHdr = false
+            isImageReadyForHdr = false
+        }
+
         val coroutineScope = rememberCoroutineScope()
         val animateClose: () -> Unit = {
             coroutineScope.launch {
                 viewModel.setAnimatingItem(currentItem.encryptedName)
 
                 isClosing = true
-                showInteractiveViewer = false // Hủy ngay HDR thông qua LaunchedEffect phía dưới
-                // LƯU Ý: KHÔNG tắt keepPagerAlive ngay ở đây nữa — giữ pager (ảnh/video full
-                // chất lượng) sống thêm một nhịp để có thể fade-out mượt thay vì biến mất
-                // đột ngột. Sẽ tắt hẳn sau khi animation hoàn tất, phía dưới.
+                showInteractiveViewer = false
+                isHdrActive = false
 
-                // Đảm bảo ảnh thumb đã được decode/cache sẵn TRƯỚC khi bắt đầu animation.
-                // Thường đã sẵn có từ lúc mở ảnh nên hầu như trả về ngay lập tức; đây chỉ là
-                // lớp bảo hiểm để tránh giật/lag nếu vì lý do gì đó thumb chưa kịp decode.
                 withTimeoutOrNull(60) {
                     snapshotFlow { thumbReady }.first { it }
                 }
 
-                // CROSSFADE: fade ảnh/video full chất lượng về alpha 0 để lộ dần ảnh thumb
-                // (đã vẽ opaque sẵn ở Lớp 2) ngay trong lúc animation zoom-out đang diễn ra.
-                // Chạy song song và NHANH HƠN animation lò xo phía dưới, để phần lớn quãng
-                // đường thu nhỏ chỉ còn phải vẽ bitmap thumb (nhẹ hơn nhiều) → mượt hơn, đỡ lag.
                 launch {
-                    closeFullQualityAlpha.animateTo(
+                    closeTransitionAlpha.animateTo(
                         targetValue = 0f,
                         animationSpec = tween(durationMillis = 200)
                     )
@@ -285,34 +364,29 @@ fun MediaViewerScreen(
                     targetValue = 0f,
                     animationSpec = spring(
                         stiffness = 400f,
-                        dampingRatio = 1.0f
+                        dampingRatio = 1.0f,
+                        visibilityThreshold = 0.0001f
                     )
                 )
 
-                // CHỈ RESET SAU KHI HOÀN THÀNH ANIMATION LÒ XO để tránh giật hình
                 dragScale = 1f
                 dragX = 0f
                 dragY = 0f
 
                 keepPagerAlive = false
-                closeFullQualityAlpha.snapTo(1f) // reset để sẵn sàng cho lần mở kế tiếp
+                closeTransitionAlpha.snapTo(1f)
                 isClosing = false
                 viewModel.setAnimatingItem(null)
                 viewModel.selectMedia(null)
             }
         }
 
-        BackHandler {
-            animateClose()
-        }
+        BackHandler { animateClose() }
 
         LaunchedEffect(Unit) {
             withFrameNanos { }
             withFrameNanos { }
-
-            withTimeoutOrNull(80) {
-                snapshotFlow { thumbReady }.first { it }
-            }
+            withTimeoutOrNull(80) { snapshotFlow { thumbReady }.first { it } }
 
             viewModel.setAnimatingItem(item.encryptedName)
 
@@ -320,7 +394,8 @@ fun MediaViewerScreen(
                 targetValue = 1f,
                 animationSpec = spring(
                     stiffness = 600f,
-                    dampingRatio = 1.0f
+                    dampingRatio = 1.0f,
+                    visibilityThreshold = 0.0001f
                 )
             )
             keepPagerAlive = true
@@ -332,6 +407,7 @@ fun MediaViewerScreen(
             dialogWindow?.let { window ->
                 val insetsController = WindowCompat.getInsetsController(window, window.decorView)
                 insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                insetsController.hide(WindowInsetsCompat.Type.statusBars())
             }
             onDispose {
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
@@ -340,13 +416,12 @@ fun MediaViewerScreen(
             }
         }
 
-        // TẮT HDR LẬP TỨC NGAY KHI showInteractiveViewer == false (Không chờ delay lò xo nữa)
-        LaunchedEffect(showInteractiveViewer) {
+        LaunchedEffect(isHdrActive) {
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                if (showInteractiveViewer) {
-                    dialogWindow?.colorMode = ActivityInfo.COLOR_MODE_HDR
+                dialogWindow?.colorMode = if (isHdrActive) {
+                    ActivityInfo.COLOR_MODE_HDR
                 } else {
-                    dialogWindow?.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
+                    ActivityInfo.COLOR_MODE_DEFAULT
                 }
             }
         }
@@ -359,6 +434,7 @@ fun MediaViewerScreen(
             }
         }
 
+        // TẢI TIER 1: THUMBNAIL (Cho animation đóng/mở)
         LaunchedEffect(currentItem, dek) {
             val key = dek ?: return@LaunchedEffect
             thumbReady = false
@@ -376,33 +452,26 @@ fun MediaViewerScreen(
 
             withContext(Dispatchers.IO) {
                 try {
-                    context.contentResolver.openInputStream(currentItem.thumbUri ?: currentItem.uri)?.use { inputStream ->
-                        val decryptedStream = BlockDecryptingInputStream(inputStream, key)
-                        val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-
-                        BitmapFactory.decodeStream(decryptedStream, null, options)
-
-                        if (originalWidth <= 0f) {
-                            originalWidth = options.outWidth.toFloat()
-                            originalHeight = options.outHeight.toFloat()
-                        }
-                    }
-
-                    context.contentResolver.openInputStream(currentItem.thumbUri ?: currentItem.uri)?.use { inputStream ->
-                        val decryptedStream = BlockDecryptingInputStream(inputStream, key)
-                        val finalOptions = BitmapFactory.Options().apply {
-                            inSampleSize = calculateInSampleSize(this, (screenW / 2).toInt(), (screenH / 2).toInt())
-                            inJustDecodeBounds = false
-                            inPreferredConfig = Bitmap.Config.RGB_565
-                        }
-
-                        val bmp = BitmapFactory.decodeStream(decryptedStream, null, finalOptions)
-                        if (bmp != null) {
-                            val imgBmp = bmp.asImageBitmap()
+                    CryptoEngine.getSgv2TierStream(context, currentItem.uri, CryptoEngine.Tier.THUMB, key)?.use { stream ->
+                        // QUAN TRỌNG: đọc trọn stream giải mã ra ByteArray rồi mới decode, KHÔNG
+                        // decodeStream() trực tiếp trên stream đang giải mã on-the-fly. Lý do:
+                        // BitmapFactory.decodeStream() dựa vào mark()/reset()/skip() của stream để
+                        // dò định dạng ảnh; nếu stream custom (giải mã CipherInputStream-based)
+                        // không cài đặt các hàm này đúng chuẩn, Skia có thể đọc THIẾU phần cuối
+                        // stream => bitmap chỉ đúng phần trên, phần dưới bị cắt/hỏng. Dùng
+                        // decodeByteArray trên buffer đã đọc đầy đủ loại bỏ hoàn toàn rủi ro này.
+                        val bytes = stream.readBytes()
+                        val finalBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (finalBmp != null) {
+                            val imgBmp = finalBmp.asImageBitmap()
                             ThumbBitmapCache.put(currentItem.encryptedName, imgBmp)
                             withContext(Dispatchers.Main) {
                                 thumbImageBitmap = imgBmp
                                 thumbReady = true
+                                if (originalWidth <= 0f) {
+                                    originalWidth = finalBmp.width.toFloat()
+                                    originalHeight = finalBmp.height.toFloat()
+                                }
                             }
                         }
                     }
@@ -413,57 +482,82 @@ fun MediaViewerScreen(
             }
         }
 
-        // QUAN TRỌNG: KHÔNG còn phụ thuộc vào showInteractiveViewer nữa — bắt đầu giải mã +
-        // decode ảnh kích thước màn hình (screen-size) NGAY khi item được chọn, chạy song song
-        // với animation zoom-in, giống Google Photos (load screen-size ngay từ đầu thay vì chờ
-        // animation zoom xong mới bắt đầu load). Ảnh sẽ tự fade vào giữa lúc đang zoom nhờ
-        // LaunchedEffect(fullImageBitmap) fade-in bên dưới, thay vì luôn xuất hiện SAU animation.
+        // TẢI TIER 2: SCREEN SIZE (Cho animation đóng/mở, đồng thời cache riêng theo item để
+        // Pager tra cứu AN TOÀN - xem ScreenBitmapCache + comment về bóng ma z-axis ở đầu file).
         LaunchedEffect(currentItem, dek) {
             if (currentItem.isVideo) return@LaunchedEffect
             val key = dek ?: return@LaunchedEffect
-            fullImageBitmap = null
-            isDecodingFullFailed = false
+            val targetName = currentItem.encryptedName
 
+            val cachedScreen = ScreenBitmapCache.get(targetName)
+            if (cachedScreen != null) {
+                screenImageBitmap = cachedScreen
+                screenImageBitmapOwner = targetName
+                return@LaunchedEffect
+            }
+
+            screenImageBitmap = null
+            screenImageBitmapOwner = null
             withContext(Dispatchers.IO) {
                 try {
-                    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    context.contentResolver.openInputStream(currentItem.uri)?.use { testIn ->
-                        val testDec = BlockDecryptingInputStream(testIn, key)
-                        BitmapFactory.decodeStream(testDec, null, options)
-                    }
-
-                    if (originalWidth <= 0f) {
-                        originalWidth = options.outWidth.toFloat()
-                        originalHeight = options.outHeight.toFloat()
-                    }
-
-                    context.contentResolver.openInputStream(currentItem.uri)?.use { inputStream ->
-                        val decryptedStream = BlockDecryptingInputStream(inputStream, key)
-                        val finalOptions = BitmapFactory.Options().apply {
-                            inSampleSize = calculateInSampleSize(options, screenW.toInt(), screenH.toInt())
-                            inJustDecodeBounds = false
+                    CryptoEngine.getSgv2TierStream(context, currentItem.uri, CryptoEngine.Tier.SCREEN, key)?.use { stream ->
+                        // Xem giải thích ở tier THUMB phía trên: đọc hết ra ByteArray trước khi
+                        // decode để tránh bitmap bị cắt/hỏng ở đáy do decodeStream() đọc thiếu
+                        // stream giải mã on-the-fly.
+                        val bytes = stream.readBytes()
+                        val finalBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        val imgBmp = finalBmp?.asImageBitmap()
+                        if (imgBmp != null) {
+                            ScreenBitmapCache.put(targetName, imgBmp)
                         }
-                        val finalBmp = BitmapFactory.decodeStream(decryptedStream, null, finalOptions)
-                        val finalImgBmp = finalBmp?.asImageBitmap()
-                        withContext(Dispatchers.Main) { fullImageBitmap = finalImgBmp }
+                        withContext(Dispatchers.Main) {
+                            screenImageBitmap = imgBmp
+                            screenImageBitmapOwner = targetName
+                        }
                     }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    isDecodingFullFailed = true
+                } catch (e: Exception) { e.printStackTrace() }
+            }
+        }
+
+        LaunchedEffect(screenImageBitmap) {
+            if (screenImageBitmap != null) {
+                screenImageAlpha.animateTo(1f, animationSpec = tween(durationMillis = 150))
+            } else {
+                screenImageAlpha.snapTo(0f)
+            }
+        }
+
+        // Tier 3 (FULL SIZE) KHÔNG còn được tải ở cấp màn hình nữa - mỗi trang trong pager
+        // (EncryptedImageViewer) tự tải + tự cache ảnh FULL của chính nó (xem FullBitmapCache
+        // và comment ở đầu file). Ở đây chỉ còn theo dõi "ảnh FULL của trang đang xem đã sẵn
+        // sàng chưa" (isImageReadyForHdr, do EncryptedImageViewer báo lên qua onFullImageReady)
+        // để bật HDR, y hệt cách isVideoReadyForHdr đang làm với video. delay(500) trước khi bật
+        // là để tránh nháy HDR trong lúc ảnh/video còn đang tải.
+        LaunchedEffect(isImageReadyForHdr, showInteractiveViewer) {
+            if (!currentItem.isVideo) {
+                if (isImageReadyForHdr && showInteractiveViewer) {
+                    delay(500)
+                    if (showInteractiveViewer) isHdrActive = true
+                } else {
+                    isHdrActive = false
                 }
             }
         }
 
-        LaunchedEffect(fullImageBitmap) {
-            if (fullImageBitmap != null) {
-                fullImageAlpha.animateTo(1f, animationSpec = tween(durationMillis = 300))
-            } else {
-                fullImageAlpha.snapTo(0f)
+        LaunchedEffect(isVideoReadyForHdr, showInteractiveViewer) {
+            if (currentItem.isVideo) {
+                if (isVideoReadyForHdr && showInteractiveViewer) {
+                    delay(500)
+                    if (showInteractiveViewer) isHdrActive = true
+                } else {
+                    isHdrActive = false
+                }
             }
         }
 
         var pagerScrollEnabled by remember { mutableStateOf(true) }
 
+        // LOAD FILE INFO
         LaunchedEffect(currentItem, dek, showInteractiveViewer) {
             if (!showInteractiveViewer) return@LaunchedEffect
             val key = dek ?: return@LaunchedEffect
@@ -473,8 +567,7 @@ fun MediaViewerScreen(
             loadingInfo = true
             withContext(Dispatchers.IO) {
                 try {
-                    context.contentResolver.openInputStream(currentItem.uri)?.use { inputStream ->
-                        val decryptedStream = BlockDecryptingInputStream(inputStream, key)
+                    CryptoEngine.getSgv2TierStream(context, currentItem.uri, CryptoEngine.Tier.FULL, key)?.use { decryptedStream ->
                         if (currentItem.isVideo) {
                             val tempFile = java.io.File(context.cacheDir, "temp_info_video")
                             try {
@@ -525,18 +618,6 @@ fun MediaViewerScreen(
             pagerScrollEnabled = true
         }
 
-        LaunchedEffect(showInteractiveViewer, showControls, isClosing) {
-            if (isClosing) return@LaunchedEffect
-            dialogWindow?.let { window ->
-                val insetsController = WindowCompat.getInsetsController(window, window.decorView)
-                if (showInteractiveViewer && !showControls) {
-                    insetsController.hide(WindowInsetsCompat.Type.statusBars())
-                } else {
-                    insetsController.show(WindowInsetsCompat.Type.statusBars())
-                }
-            }
-        }
-
         val transitionShape = remember(startWidth, startHeight, screenW, screenH) {
             object : Shape {
                 override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
@@ -558,42 +639,88 @@ fun MediaViewerScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer {
-                            // Lúc đang đóng: fade mượt theo closeFullQualityAlpha thay vì
-                            // biến mất tức thời, để crossfade với ảnh thumb ở Lớp 2 bên dưới.
-                            alpha = if (showInteractiveViewer) 1f else closeFullQualityAlpha.value
+                            alpha = if (showInteractiveViewer) 1f else 0f
                         }
                 ) {
                     HorizontalPager(
                         state = pagerState,
                         userScrollEnabled = pagerScrollEnabled && showInteractiveViewer,
                         beyondViewportPageCount = 1,
+                        // FIX BÓNG MA Z-AXIS KHI VUỐT: bắt buộc phải có key theo DANH TÍNH item
+                        // (encryptedName), KHÔNG được để Pager tự dùng vị trí (page index) làm
+                        // key mặc định. Nếu không có key riêng, Compose coi "slot" của từng trang
+                        // gắn với SỐ THỨ TỰ trang chứ không phải với item nào đang đứng ở đó. Khi
+                        // vuốt, trong lúc pagerState.currentPage vừa đổi nhưng Pager (đặc biệt với
+                        // beyondViewportPageCount = 1 giữ sẵn trang lân cận) vẫn còn 1-2 khung
+                        // hình mà 2 slot cũ/mới trùng vùng vẽ - Compose vẽ theo THỨ TỰ ĐẶT
+                        // (placement order) của slot, không phải theo currentPage, nên trang cũ có
+                        // thể bị đặt/vẽ TRƯỚC (dưới) trang mới trong khoảnh khắc đó => bóng ma.
+                        // key = { index } (gán lại đúng mặc định) KHÔNG sửa được gì vì đó vốn đã là
+                        // hành vi mặc định của Pager. Phải key theo item.encryptedName để mỗi slot
+                        // luôn gắn cố định với đúng 1 item bất kể vị trí, tránh Compose nhầm lẫn.
+                        key = { page -> items[page].encryptedName },
                         modifier = Modifier.fillMaxSize()
                     ) { page ->
                         val pageItem = items[page]
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        val isCurrentPage = page == pagerState.currentPage
+
+                        // Thumbnail cache riêng cho TỪNG trang (kể cả lân cận) - luôn đúng cho
+                        // đúng trang, không thể lẫn sang trang khác vì key theo pageItem.
+                        val cachedThumb = remember(pageItem.encryptedName) {
+                            ThumbBitmapCache.get(pageItem.encryptedName)
+                        }
+
+                        // FIX BUG "ảnh đột nhiên mờ đi rồi mới nét lại khi vừa mở full screen":
+                        // Pager (và EncryptedImageViewer bên trong) chỉ được mount SAU KHI
+                        // animation Canvas mở ảnh (Tier THUMB -> Tier SCREEN) chạy xong. Ngay tại
+                        // thời điểm handoff đó, EncryptedImageViewer của trang đang mở lại BẮT ĐẦU
+                        // TỪ ĐẦU: painter Coil (Tier SCREEN) của riêng nó chưa load xong, ảnh FULL
+                        // cũng chưa decode xong, nên frame đầu tiên chỉ có "placeholderBitmap" -
+                        // nếu placeholder đó là cachedThumb (Tier THUMB, độ phân giải thấp nhất)
+                        // thì so với Tier SCREEN vừa hiện xong trên Canvas một khoảnh khắc trước,
+                        // người dùng thấy ảnh "tụt" nét -> đúng cảm giác "mờ đột ngột".
+                        //
+                        // cachedScreen: tra cứu Tier SCREEN riêng theo item từ ScreenBitmapCache -
+                        // AN TOÀN cho mọi trang (kể cả trang lân cận đã từng xem), không thể lẫn
+                        // sang item khác vì key theo đúng pageItem.encryptedName.
+                        val cachedScreen = remember(pageItem.encryptedName) {
+                            ScreenBitmapCache.get(pageItem.encryptedName)
+                        }
+
+                        // Điều kiện CŨ chỉ gate bằng `isCurrentPage` trần trụi - KHÔNG hề xác nhận
+                        // biến screenImageBitmap dùng chung có THỰC SỰ chứa bitmap của pageItem
+                        // này hay không, nên trang mới có thể bị gán NHẦM ảnh của trang cũ (xem
+                        // comment ScreenBitmapCache ở đầu file). FIX: so khớp OWNER THỰC SỰ
+                        // (screenImageBitmapOwner == pageItem.encryptedName) - chỉ đúng khi biến
+                        // dùng chung đã được xác nhận nạp xong cho ĐÚNG item này.
+                        val bestPlaceholder = when {
+                            isCurrentPage &&
+                                    screenImageBitmapOwner == pageItem.encryptedName &&
+                                    screenImageBitmap != null -> screenImageBitmap
+                            cachedScreen != null -> cachedScreen
+                            else -> cachedThumb
+                        }
+
+                        Box(
+                            modifier = Modifier.fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
                             if (pageItem.isVideo) {
                                 dek?.let { key ->
                                     EncryptedVideoPlayer(
                                         context = context,
                                         item = pageItem,
                                         dek = key,
-                                        isActive = (page == pagerState.currentPage) && showInteractiveViewer,
+                                        isActive = isCurrentPage && showInteractiveViewer,
+                                        isInteractive = showInteractiveViewer,
                                         showControls = showControls,
-                                        placeholderBitmap = if (pageItem.encryptedName == currentItem.encryptedName) (fullImageBitmap ?: thumbImageBitmap) else null,
+                                        placeholderBitmap = bestPlaceholder,
                                         onTap = { showControls = !showControls },
-                                        onDismissDragStart = {
-                                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                                                dialogWindow?.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
-                                            }
-                                        },
-                                        onDismissDragCancel = { // PHỤC HỒI HDR NẾU HỦY KÉO
-                                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                                                dialogWindow?.colorMode = ActivityInfo.COLOR_MODE_HDR
-                                            }
-                                        },
+                                        onVideoReady = { if (isCurrentPage) isVideoReadyForHdr = true },
+                                        onDismissDragStart = { if (isCurrentPage) isHdrActive = false },
+                                        onDismissDragCancel = { if (isCurrentPage && isVideoReadyForHdr) isHdrActive = true },
                                         onDismiss = { scaleVal, xVal, yVal ->
                                             dragScale = scaleVal
-                                            // Bù trừ trục X và Y để match với TransformOrigin(0f, 0f) của Lớp 2
                                             dragX = xVal + (screenW / 2f) * (1f - scaleVal)
                                             dragY = yVal + (screenH / 2f) * (1f - scaleVal)
                                             animateClose()
@@ -601,35 +728,33 @@ fun MediaViewerScreen(
                                     )
                                 }
                             } else {
-                                customImageLoader?.let { loader ->
+                                val loader = customImageLoader
+                                val key = dek
+                                if (loader != null && key != null) {
+                                    // Không còn truyền fullBitmap từ cấp màn hình xuống nữa - mỗi
+                                    // trang (EncryptedImageViewer) tự tải + tự cache ảnh FULL của
+                                    // chính pageItem, hoàn toàn tách biệt theo từng trang.
                                     EncryptedImageViewer(
                                         context = context,
                                         item = pageItem,
                                         imageLoader = loader,
-                                        placeholderBitmap = if (pageItem.encryptedName == currentItem.encryptedName) (fullImageBitmap ?: thumbImageBitmap) else null,
-                                        onDismissDragStart = {
-                                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                                                dialogWindow?.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
-                                            }
-                                        },
-                                        onDismissDragCancel = { // PHỤC HỒI HDR NẾU HỦY KÉO
-                                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                                                dialogWindow?.colorMode = ActivityInfo.COLOR_MODE_HDR
-                                            }
-                                        },
+                                        dek = key,
+                                        placeholderBitmap = bestPlaceholder,
+                                        onDismissDragStart = { if (isCurrentPage) isHdrActive = false },
+                                        onDismissDragCancel = { if (isCurrentPage) isHdrActive = true },
                                         onDismiss = { scaleVal, xVal, yVal ->
                                             dragScale = scaleVal
-                                            // Bù trừ trục X và Y để match với TransformOrigin(0f, 0f) của Lớp 2
                                             dragX = xVal + (screenW / 2f) * (1f - scaleVal)
                                             dragY = yVal + (screenH / 2f) * (1f - scaleVal)
                                             animateClose()
                                         },
                                         onScaleChanged = { scale ->
-                                            if (page == pagerState.currentPage) {
+                                            if (isCurrentPage) {
                                                 pagerScrollEnabled = scale <= 1.05f
                                             }
                                         },
-                                        onTap = { showControls = !showControls }
+                                        onTap = { showControls = !showControls },
+                                        onFullImageReady = { if (isCurrentPage) isImageReadyForHdr = true }
                                     )
                                 }
                             }
@@ -638,7 +763,7 @@ fun MediaViewerScreen(
                 }
             }
 
-            // LỚP 2: LÒ XO MƯỢT MÀ OVERLAY
+            // LỚP VẼ CANVAS CHO ANIMATION
             if (!showInteractiveViewer || isEntering) {
                 val currentTargetBounds = if (isEntering) startBounds else (boundsMap[currentItem.encryptedName] ?: startBounds)
                 val trStartLeft = currentTargetBounds[0]
@@ -649,7 +774,6 @@ fun MediaViewerScreen(
                         .fillMaxSize()
                         .drawBehind {
                             val t = progress.value
-                            // KHỚP CÔNG THỨC ALPHA: Mờ dần chuẩn từ ngưỡng vuốt
                             drawRect(Color.Black, alpha = t * (1f - (kotlin.math.abs(dragY) / (screenH / 2f)).coerceIn(0f, 1f)))
                         }
                 ) {
@@ -675,67 +799,40 @@ fun MediaViewerScreen(
                             val currentBoxW = lerp(startWidth, screenW, t)
                             val currentBoxH = lerp(startHeight, screenH, t)
 
-                            // Full chỉ coi là "opaque hoàn toàn" khi CẢ 2 alpha (mở + đóng) đều gần 1.
-                            // Nhờ vậy, ngay khi bắt đầu đóng (closeFullQualityAlpha bắt đầu giảm),
-                            // ảnh thumb sẽ được vẽ lộ ra ở dưới để crossfade.
-                            val isFullOpaque = !currentItem.isVideo && fullImageBitmap != null &&
-                                    fullImageAlpha.value >= 0.95f && closeFullQualityAlpha.value >= 0.95f
+                            fun drawLayer(imgBmp: androidx.compose.ui.graphics.ImageBitmap, opacity: Float) {
+                                if (opacity <= 0f) return
+                                val srcW = imgBmp.width.toFloat()
+                                val srcH = imgBmp.height.toFloat()
+                                if (srcW > 0f && srcH > 0f) {
+                                    val coverScale = maxOf(startWidth / srcW, startHeight / srcH)
+                                    val fitScale = minOf(screenW / srcW, screenH / srcH)
+                                    val curScale = lerp(coverScale, fitScale, t)
 
-                            if (!isFullOpaque) {
-                                thumbImageBitmap?.let { imgBmp ->
-                                    val srcW = imgBmp.width.toFloat()
-                                    val srcH = imgBmp.height.toFloat()
-                                    if (srcW > 0f && srcH > 0f) {
-                                        val coverScale = maxOf(startWidth / srcW, startHeight / srcH)
-                                        val fitScale = minOf(screenW / srcW, screenH / srcH)
-                                        val curScale = lerp(coverScale, fitScale, t)
+                                    val curImgW = srcW * curScale
+                                    val curImgH = srcH * curScale
 
-                                        val curImgW = srcW * curScale
-                                        val curImgH = srcH * curScale
+                                    val imgX = (currentBoxW - curImgW) / 2f
+                                    val imgY = (currentBoxH - curImgH) / 2f
 
-                                        val imgX = (currentBoxW - curImgW) / 2f
-                                        val imgY = (currentBoxH - curImgH) / 2f
-
-                                        translate(imgX, imgY) {
-                                            scale(curScale, curScale, pivot = Offset.Zero) {
-                                                drawImage(
-                                                    image = imgBmp,
-                                                    filterQuality = FilterQuality.Low
-                                                )
-                                            }
+                                    translate(imgX, imgY) {
+                                        scale(curScale, curScale, pivot = Offset.Zero) {
+                                            drawImage(
+                                                image = imgBmp,
+                                                alpha = opacity,
+                                                filterQuality = FilterQuality.Low
+                                            )
                                         }
                                     }
                                 }
                             }
 
-                            if (!currentItem.isVideo) {
-                                fullImageBitmap?.let { imgBmp ->
-                                    val srcW = imgBmp.width.toFloat()
-                                    val srcH = imgBmp.height.toFloat()
-                                    if (srcW > 0f && srcH > 0f) {
-                                        val coverScale = maxOf(startWidth / srcW, startHeight / srcH)
-                                        val fitScale = minOf(screenW / srcW, screenH / srcH)
-                                        val curScale = lerp(coverScale, fitScale, t)
+                            if (thumbImageBitmap != null) {
+                                drawLayer(thumbImageBitmap!!, 1f)
+                            }
 
-                                        val curImgW = srcW * curScale
-                                        val curImgH = srcH * curScale
-
-                                        val imgX = (currentBoxW - curImgW) / 2f
-                                        val imgY = (currentBoxH - curImgH) / 2f
-
-                                        translate(imgX, imgY) {
-                                            scale(curScale, curScale, pivot = Offset.Zero) {
-                                                drawImage(
-                                                    image = imgBmp,
-                                                    // Kết hợp alpha "mở" (fade-in lúc vào) và alpha "đóng"
-                                                    // (fade-out lúc zoom-out) để crossfade cả 2 chiều.
-                                                    alpha = (fullImageAlpha.value * closeFullQualityAlpha.value).coerceIn(0f, 1f),
-                                                    filterQuality = FilterQuality.Low
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
+                            if (screenImageBitmap != null) {
+                                val screenDrawAlpha = (screenImageAlpha.value * closeTransitionAlpha.value).coerceIn(0f, 1f)
+                                drawLayer(screenImageBitmap!!, screenDrawAlpha)
                             }
                         }
                     }
@@ -752,7 +849,6 @@ fun MediaViewerScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .background(Color.Black.copy(alpha = 0.5f))
-                        .windowInsetsPadding(WindowInsets.statusBars)
                         .padding(horizontal = 8.dp, vertical = 12.dp)
                 ) {
                     Row(
@@ -861,7 +957,7 @@ fun MediaViewerScreen(
                 AlertDialog(
                     onDismissRequest = { showDeleteDialog = false },
                     title = { Text("Delete Secure Media?") },
-                    text = { Text("This will permanently decrypt and erase '${currentItem.originalName}' and its thumbnail sidecar from storage. This cannot be undone.") },
+                    text = { Text("This will permanently decrypt and erase '${currentItem.originalName}' from storage. This cannot be undone.") },
                     confirmButton = {
                         Button(
                             onClick = {
@@ -888,43 +984,137 @@ fun EncryptedImageViewer(
     context: Context,
     item: VaultItem,
     imageLoader: ImageLoader,
+    dek: ByteArray,
     placeholderBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
     onDismiss: (scale: Float, x: Float, y: Float) -> Unit,
     onDismissDragStart: () -> Unit = {},
     onDismissDragCancel: () -> Unit = {},
     onScaleChanged: (Float) -> Unit,
-    onTap: () -> Unit
+    onTap: () -> Unit,
+    onFullImageReady: () -> Unit = {}
 ) {
     val coroutineScope = rememberCoroutineScope()
     val scale = remember { Animatable(1f) }
     val offsetX = remember { Animatable(0f) }
     val offsetY = remember { Animatable(0f) }
 
-    // THÊM 2 DÒNG NÀY: Lấy screenH từ context
+    // FIX BUG "pinch to zoom càng to thì nền đen càng mờ về 0": trước đây alpha nền đen được
+    // tính trực tiếp từ offsetY.value, nhưng offsetY cũng bị thay đổi bởi logic pinch-zoom
+    // (theo dõi centroid 2 ngón) và bởi pan khi đã zoom - không chỉ riêng lúc kéo-để-đóng. Vì
+    // vậy chỉ cần zoom to là offsetY lệch khỏi 0, kéo theo nền đen mờ dần dù người dùng không
+    // hề vuốt để đóng. Giờ tách riêng 1 Animatable CHỈ được cập nhật trong đúng nhánh kéo-để-
+    // đóng (isDraggingToDismiss) bên dưới; mọi trường hợp khác (pinch, pan khi zoom, double tap)
+    // đều không đụng vào nó nên nền đen luôn giữ cố định alpha = 1f.
+    val backgroundDimAlpha = remember { Animatable(1f) }
+
     val displayMetrics = context.resources.displayMetrics
     val screenH = displayMetrics.heightPixels.toFloat()
 
     LaunchedEffect(scale.value) { onScaleChanged(scale.value) }
 
+    // TẢI TIER 3 (FULL SIZE) NGAY TRONG TỪNG TRANG - key theo item.encryptedName của CHÍNH
+    // trang này (KHÔNG theo pagerState.currentPage). Đây là chỗ fix nguyên nhân gây nháy/bóng
+    // ma ảnh cũ khi vuốt ngang: trước đây bitmap FULL nằm ở 1 state DÙNG CHUNG cấp màn hình,
+    // gắn vào "trang hiện tại" bằng cờ isCurrentPage nên bị trễ 1 nhịp mỗi khi đổi trang. Giờ
+    // mỗi trang tự quản lý dữ liệu của chính nó nên không còn khả năng lẫn ảnh giữa các trang.
+    // Có FullBitmapCache (LRU) nên: quay lại trang đã xem sẽ hiện ngay; đồng thời nhờ
+    // beyondViewportPageCount = 1 của HorizontalPager, trang kế bên cũng được "mồi" ảnh full
+    // trước trong lúc user còn đang xem trang hiện tại -> lúc vuốt sang gần như không có độ trễ.
+    var fullBitmap by remember(item.encryptedName) {
+        mutableStateOf(FullBitmapCache.get(item.encryptedName))
+    }
+    val fullImageAlpha = remember(item.encryptedName) {
+        Animatable(if (FullBitmapCache.get(item.encryptedName) != null) 1f else 0f)
+    }
+
+    LaunchedEffect(item.encryptedName, dek) {
+        val cachedFull = FullBitmapCache.get(item.encryptedName)
+        if (cachedFull != null) {
+            fullBitmap = cachedFull
+            return@LaunchedEffect
+        }
+
+        withContext(Dispatchers.IO) {
+            // FIX BUG "ảnh full đôi lúc không bao giờ nét lại": trước đây nếu getSgv2TierStream
+            // trả về null, hoặc decode ra lỗi/exception (ví dụ lỗi IO/giải mã thoáng qua), code
+            // chỉ log lỗi rồi DỪNG HẲN - fullBitmap giữ nguyên null mãi mãi, ảnh full không bao
+            // giờ hiện lên nữa dù thumb/screen vẫn hiển thị bình thường (trông như "kẹt mờ vĩnh
+            // viễn"). Giờ thử lại tối đa 3 lần với backoff ngắn trước khi thực sự bỏ cuộc, để
+            // vượt qua các lỗi IO/giải mã thoáng qua (transient) mà không cần người dùng phải tự
+            // thoát ra vào lại ảnh.
+            var attempt = 0
+            val maxAttempts = 3
+            var succeeded = false
+            while (!succeeded && attempt < maxAttempts) {
+                attempt++
+                try {
+                    CryptoEngine.getSgv2TierStream(context, item.uri, CryptoEngine.Tier.FULL, dek)?.use { stream ->
+                        // FIX BUG "ảnh full bị cắt/mờ ở đáy, lộ thumb bên dưới":
+                        // Trước đây decode thẳng từ `stream` (đang giải mã on-the-fly, kiểu
+                        // CipherInputStream) bằng decodeStream(). Hàm này của Skia dựa vào
+                        // mark()/reset()/skip() để dò header & đọc dữ liệu ảnh; với stream giải mã
+                        // custom, các hàm này thường không đảm bảo đúng chuẩn InputStream, khiến
+                        // Skia đọc THIẾU phần cuối stream với ảnh lớn/JPEG progressive. Kết quả:
+                        // bitmap chỉ decode đúng phần trên, phần đáy bị hỏng/trống -> khi layer FULL
+                        // này vẽ đè lên layer SCREEN (tier thấp hơn, trông "mờ" hơn) ở dưới, phần đáy
+                        // bị thiếu sẽ để lộ layer SCREEN ra ngoài, y hệt hiện tượng "cắt đáy lộ thumb".
+                        //
+                        // FIX: đọc TRỌN VẸN stream ra ByteArray trong bộ nhớ trước, rồi decode bằng
+                        // decodeByteArray trên buffer đã đầy đủ - không còn phụ thuộc hành vi
+                        // mark/reset/skip của stream giải mã nữa nên không thể bị đọc thiếu.
+                        val bytes = stream.readBytes()
+                        val options = BitmapFactory.Options().apply {
+                            inPreferredConfig = Bitmap.Config.ARGB_8888
+                            inJustDecodeBounds = false
+                        }
+                        val finalBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+                        if (finalBmp != null) {
+                            val imgBmp = finalBmp.asImageBitmap()
+                            FullBitmapCache.put(item.encryptedName, imgBmp)
+                            withContext(Dispatchers.Main) {
+                                fullBitmap = imgBmp
+                            }
+                            succeeded = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                if (!succeeded && attempt < maxAttempts) {
+                    delay(150L * attempt)
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(fullBitmap) {
+        if (fullBitmap != null) {
+            fullImageAlpha.animateTo(1f, animationSpec = tween(durationMillis = 250))
+            onFullImageReady()
+        }
+    }
+
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            // SỬA LẠI DÒNG NÀY: Dùng screenH / 2f thay vì constraints.maxHeight / 2f
-            .background(Color.Black.copy(alpha = (1f - (kotlin.math.abs(offsetY.value) / (screenH / 2f))).coerceIn(0f, 1f)))
+            .background(Color.Black.copy(alpha = backgroundDimAlpha.value))
             .testTag("image_viewer_container"),
         contentAlignment = Alignment.Center
     ) {
         val width = constraints.maxWidth.toFloat()
         val height = constraints.maxHeight.toFloat()
 
-        // NGƯỠNG MỚI THẤP HƠN NHIỀU (15% chiều cao màn hình)
         val dismissThreshold = height * 0.15f
-
-        // ... (Phần code bên dưới giữ nguyên không thay đổi)
 
         val gestureModifier = Modifier.pointerInput(width, height) {
             var lastTapTime = 0L
             var lastTapPosition = Offset.Zero
+            // FIX BUG "double tap to zoom làm topbar/overlay hiện lên": chạm đầu tiên của 1 cú
+            // double-tap trước đây gọi onTap() ngay khi nhấc tay (vì tại thời điểm đó chưa biết
+            // sẽ có chạm thứ 2 hay không), khiến showControls bật lên trước khi chạm thứ 2 kịp
+            // tới để zoom. Giờ trì hoãn onTap() đúng bằng cửa sổ double-tap (300ms); nếu chạm
+            // thứ 2 tới trong lúc đó, job này bị hủy nên onTap() không bao giờ chạy.
+            var pendingSingleTapJob: Job? = null
 
             awaitEachGesture {
                 val down = awaitFirstDown(requireUnconsumed = false)
@@ -945,6 +1135,8 @@ fun EncryptedImageViewer(
                 if (isDoubleTap) {
                     lastTapTime = 0L
                     lastTapPosition = Offset.Zero
+                    pendingSingleTapJob?.cancel()
+                    pendingSingleTapJob = null
                     down.consume()
 
                     val targetScale = if (scale.value > 1.05f) 1f else 2.5f
@@ -954,11 +1146,30 @@ fun EncryptedImageViewer(
                         coroutineScope.launch { offsetY.animateTo(0f, spring()) }
                     } else {
                         val maxOffsetX = (width * 2.5f - width) / 2f
-                        val maxOffsetY = (height * 2.5f - height) / 2f
                         val targetX = ((width / 2f) - down.position.x) * 1.5f
-                        val targetY = ((height / 2f) - down.position.y) * 1.5f
                         coroutineScope.launch { offsetX.animateTo(targetX.coerceIn(-maxOffsetX, maxOffsetX), spring()) }
-                        coroutineScope.launch { offsetY.animateTo(targetY.coerceIn(-maxOffsetY, maxOffsetY), spring()) }
+
+                        // Căn trục Y giống hệt logic pinch-to-zoom bên dưới: dùng chiều cao THẬT
+                        // của ảnh sau khi fit vào khung (không phải height * scale trần trụi), để
+                        // không lệch tâm khi ảnh bị letterbox trên/dưới ở scale = 1 (vd ảnh ngang
+                        // trong khung dọc - chiều cao ảnh vốn đã nhỏ hơn container ngay cả trước
+                        // khi nhân scale).
+                        val bmpW = (fullBitmap?.width ?: placeholderBitmap?.width)?.toFloat() ?: 0f
+                        val bmpH = (fullBitmap?.height ?: placeholderBitmap?.height)?.toFloat() ?: 0f
+                        val fittedHeight = if (bmpW > 0f && bmpH > 0f) {
+                            bmpH * kotlin.math.min(width / bmpW, height / bmpH)
+                        } else {
+                            height
+                        }
+                        val actualImageHeight = fittedHeight * targetScale
+                        val targetY = if (actualImageHeight <= height) {
+                            // Ảnh đã zoom vẫn thấp hơn hoặc bằng màn hình -> ép căn giữa Y.
+                            0f
+                        } else {
+                            val maxOffsetY = (actualImageHeight - height) / 2f
+                            (((height / 2f) - down.position.y) * 1.5f).coerceIn(-maxOffsetY, maxOffsetY)
+                        }
+                        coroutineScope.launch { offsetY.animateTo(targetY, spring()) }
                     }
                 } else {
                     lastTapTime = currentTime
@@ -1049,18 +1260,20 @@ fun EncryptedImageViewer(
                                     if (!isDraggingToDismiss) onDismissDragStart()
                                     isDraggingToDismiss = true
 
-                                    // Cập nhật cả trục Y và trục X để ảnh đi theo ngón tay
                                     gestureOffsetY += delta.y
                                     gestureOffsetX += delta.x
 
-                                    // THU NHỎ KHI KÉO: tối đa giảm về 60% (tạo hiệu ứng kéo lùi về trục Z)
                                     val swipeProgress = (kotlin.math.abs(gestureOffsetY) / (height * 0.8f)).coerceIn(0f, 1f)
                                     gestureScale = (1f - (swipeProgress * 0.4f)).coerceAtLeast(0.6f)
+                                    // Nền đen CHỈ mờ đi ở đúng nhánh kéo-để-đóng này (không phải
+                                    // pinch/pan-khi-zoom) - xem giải thích ở khai báo backgroundDimAlpha.
+                                    val dimAlpha = (1f - (kotlin.math.abs(gestureOffsetY) / (screenH / 2f))).coerceIn(0f, 1f)
 
                                     coroutineScope.launch {
-                                        offsetX.snapTo(gestureOffsetX) // Snap theo trục X
+                                        offsetX.snapTo(gestureOffsetX)
                                         offsetY.snapTo(gestureOffsetY)
                                         scale.snapTo(gestureScale)
+                                        backgroundDimAlpha.snapTo(dimAlpha)
                                     }
                                     pointer.consume()
                                 }
@@ -1069,7 +1282,13 @@ fun EncryptedImageViewer(
                     }
 
                     if (!isPinching && !isDraggingToDismiss && !hasMovedSignificantDistance) {
-                        onTap()
+                        // Không gọi onTap() ngay - chờ hết cửa sổ double-tap (300ms) để chắc chắn
+                        // đây không phải là chạm đầu của 1 cú double-tap (xem pendingSingleTapJob).
+                        pendingSingleTapJob?.cancel()
+                        pendingSingleTapJob = coroutineScope.launch {
+                            delay(300L)
+                            onTap()
+                        }
                     } else if (scale.value < 1f && !isDraggingToDismiss) {
                         coroutineScope.launch { scale.animateTo(1f, spring()) }
                         coroutineScope.launch { offsetX.animateTo(0f, spring()) }
@@ -1078,19 +1297,52 @@ fun EncryptedImageViewer(
                         if (offsetY.value > dismissThreshold) {
                             onDismiss(scale.value, offsetX.value, offsetY.value)
                         } else {
-                            // HỦY VUỐT TRẢ VỀ BAN ĐẦU + KHÔI PHỤC HDR
                             onDismissDragCancel()
-                            coroutineScope.launch { offsetX.animateTo(0f, spring()) } // Thêm dòng này để trả X về 0
+                            coroutineScope.launch { offsetX.animateTo(0f, spring()) }
                             coroutineScope.launch { offsetY.animateTo(0f, spring()) }
                             coroutineScope.launch { scale.animateTo(1f, spring()) }
+                            coroutineScope.launch { backgroundDimAlpha.animateTo(1f, spring()) }
                         }
                     } else if (scale.value > 1f) {
                         val maxOffsetX = (width * scale.value - width) / 2f
-                        val maxOffsetY = (height * scale.value - height) / 2f
                         val targetX = offsetX.value.coerceIn(-maxOffsetX, maxOffsetX)
-                        val targetY = offsetY.value.coerceIn(-maxOffsetY, maxOffsetY)
                         coroutineScope.launch { offsetX.animateTo(targetX, spring()) }
-                        coroutineScope.launch { offsetY.animateTo(targetY, spring()) }
+
+                        // LOGIC MỚI: căn giữa trục Y theo chiều cao THẬT của ảnh đã zoom, không
+                        // dùng "height * scale.value" như cũ (sai khi ảnh bị letterbox trên/dưới
+                        // ở scale=1, ví dụ ảnh ngang trong khung dọc - lúc đó chiều cao ảnh vốn đã
+                        // nhỏ hơn container ngay cả trước khi nhân scale). Ưu tiên lấy kích thước
+                        // gốc từ fullBitmap, fallback placeholderBitmap, cuối cùng mới fallback về
+                        // đúng bằng height container nếu chưa có bitmap nào.
+                        val bmpW = (fullBitmap?.width ?: placeholderBitmap?.width)?.toFloat() ?: 0f
+                        val bmpH = (fullBitmap?.height ?: placeholderBitmap?.height)?.toFloat() ?: 0f
+                        val fittedHeight = if (bmpW > 0f && bmpH > 0f) {
+                            bmpH * kotlin.math.min(width / bmpW, height / bmpH)
+                        } else {
+                            height
+                        }
+                        val actualImageHeight = fittedHeight * scale.value
+
+                        if (actualImageHeight <= height) {
+                            // Ảnh đã zoom vẫn thấp hơn hoặc bằng màn hình -> ép căn giữa Y, dùng
+                            // spring cứng (stiffness 600f) theo đúng yêu cầu để snap dứt khoát.
+                            coroutineScope.launch {
+                                offsetY.animateTo(
+                                    0f,
+                                    animationSpec = spring(
+                                        stiffness = 600f,
+                                        dampingRatio = 1.0f,
+                                        visibilityThreshold = 0.0001f
+                                    )
+                                )
+                            }
+                        } else {
+                            // Ảnh đã zoom cao hơn màn hình -> tự do trục Y, chỉ chặn trong biên
+                            // hợp lệ chứ không ép về giữa nữa.
+                            val maxOffsetY = (actualImageHeight - height) / 2f
+                            val targetY = offsetY.value.coerceIn(-maxOffsetY, maxOffsetY)
+                            coroutineScope.launch { offsetY.animateTo(targetY, spring()) }
+                        }
                     }
                 }
             }
@@ -1102,19 +1354,24 @@ fun EncryptedImageViewer(
                 .then(gestureModifier),
             contentAlignment = Alignment.Center
         ) {
+            // LỚP NỀN: Screen tier (qua Coil) hoặc Thumbnail cache của CHÍNH trang này. Luôn vẽ
+            // lớp này trước để không bao giờ có 1 frame "trắng tay" trong lúc chờ FULL giải mã -
+            // đây là phần trực tiếp chống hiện tượng đen/cắt cụt khi chuyển trang.
+            val tierScreenUri = remember(item.uri) {
+                item.uri.buildUpon().appendQueryParameter("tier", "SCREEN").build()
+            }
             val painter = rememberAsyncImagePainter(
                 model = ImageRequest.Builder(context)
-                    .data(item.uri)
-                    .size(CoilSize.ORIGINAL)
+                    .data(tierScreenUri)
                     .build(),
                 imageLoader = imageLoader
             )
             val painterState = painter.state
 
-            if (painterState !is coil.compose.AsyncImagePainter.State.Success && placeholderBitmap != null) {
+            if (painterState is coil.compose.AsyncImagePainter.State.Success) {
                 Image(
-                    bitmap = placeholderBitmap,
-                    contentDescription = null,
+                    painter = painter,
+                    contentDescription = item.originalName,
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer(
@@ -1122,36 +1379,45 @@ fun EncryptedImageViewer(
                             scaleY = scale.value,
                             translationX = offsetX.value,
                             translationY = offsetY.value
-                        ),
+                        )
+                        .testTag("encrypted_image"),
+                    contentScale = ContentScale.Fit
+                )
+            } else if (placeholderBitmap != null) {
+                Image(
+                    bitmap = placeholderBitmap,
+                    contentDescription = item.originalName,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale.value,
+                            scaleY = scale.value,
+                            translationX = offsetX.value,
+                            translationY = offsetY.value
+                        )
+                        .testTag("encrypted_image"),
                     contentScale = ContentScale.Fit
                 )
             }
 
-            Image(
-                painter = painter,
-                contentDescription = item.originalName,
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer(
-                        scaleX = scale.value,
-                        scaleY = scale.value,
-                        translationX = offsetX.value,
-                        translationY = offsetY.value
-                    )
-                    .testTag("encrypted_image"),
-                contentScale = ContentScale.Fit
-            )
-
-            if (scale.value > 1f) {
-                Text(
-                    text = "Pinch to zoom active (${"%.1f".format(scale.value)}x)",
-                    color = Color.White.copy(alpha = 0.6f),
-                    fontSize = 11.sp,
+            // LỚP PHỦ: ảnh FULL SIZE của CHÍNH trang này, crossfade nhẹ lên trên lớp nền khi
+            // giải mã xong (hoặc hiện ngay nếu đã có trong FullBitmapCache từ lần xem trước).
+            val currentFullBitmap = fullBitmap
+            if (currentFullBitmap != null) {
+                Image(
+                    bitmap = currentFullBitmap,
+                    contentDescription = item.originalName,
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(16.dp)
-                        .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale.value,
+                            scaleY = scale.value,
+                            translationX = offsetX.value,
+                            translationY = offsetY.value,
+                            alpha = fullImageAlpha.value
+                        )
+                        .testTag("encrypted_image_full"),
+                    contentScale = ContentScale.Fit
                 )
             }
         }
@@ -1164,42 +1430,48 @@ fun EncryptedVideoPlayer(
     item: VaultItem,
     dek: ByteArray,
     isActive: Boolean,
+    isInteractive: Boolean,
     showControls: Boolean,
     placeholderBitmap: androidx.compose.ui.graphics.ImageBitmap?,
     onTap: () -> Unit,
+    onVideoReady: () -> Unit,
     onDismissDragStart: () -> Unit = {},
     onDismissDragCancel: () -> Unit = {},
     onDismiss: (Float, Float, Float) -> Unit
 ) {
     var isVideoReady by remember { mutableStateOf(false) }
+    var exoPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
 
-    val exoPlayer = remember(item.uri) {
-        ExoPlayer.Builder(context).build().apply {
-            val mediaSource = ProgressiveMediaSource.Factory(
-                EncryptedDataSourceFactory(context, dek)
-            ).createMediaSource(MediaItem.fromUri(item.uri))
-            setMediaSource(mediaSource)
-            prepare()
-            playWhenReady = false
-
-            addListener(object : Player.Listener {
-                override fun onRenderedFirstFrame() {
-                    isVideoReady = true
-                }
-            })
-        }
-    }
-
+    // FIX TẠI ĐÂY: Trì hoãn việc tạo ExoPlayer cho tới khi trang này thực sự Active
+    // Tránh bị lock frame UI khi đang vuốt ngang.
     LaunchedEffect(isActive) {
-        exoPlayer.playWhenReady = isActive
-        if (!isActive) {
-            exoPlayer.pause()
+        if (isActive) {
+            if (exoPlayer == null) {
+                exoPlayer = ExoPlayer.Builder(context).build().apply {
+                    val mediaSource = ProgressiveMediaSource.Factory(
+                        EncryptedDataSourceFactory(context, dek)
+                    ).createMediaSource(MediaItem.fromUri(item.uri))
+                    setMediaSource(mediaSource)
+                    prepare()
+                    addListener(object : Player.Listener {
+                        override fun onRenderedFirstFrame() {
+                            isVideoReady = true
+                            onVideoReady()
+                        }
+                    })
+                }
+            }
+            exoPlayer?.playWhenReady = true
+        } else {
+            exoPlayer?.playWhenReady = false
+            exoPlayer?.pause()
         }
     }
 
     DisposableEffect(item.uri) {
         onDispose {
-            exoPlayer.release()
+            exoPlayer?.release()
+            exoPlayer = null
         }
     }
 
@@ -1208,10 +1480,10 @@ fun EncryptedVideoPlayer(
     var currentPosition by remember { mutableStateOf(0L) }
 
     LaunchedEffect(exoPlayer) {
-        while (true) {
-            currentPosition = exoPlayer.currentPosition
-            duration = exoPlayer.duration.coerceAtLeast(0L)
-            isPlaying = exoPlayer.isPlaying
+        while (exoPlayer != null) {
+            currentPosition = exoPlayer!!.currentPosition
+            duration = exoPlayer!!.duration.coerceAtLeast(0L)
+            isPlaying = exoPlayer!!.isPlaying
             delay(250)
         }
     }
@@ -1224,7 +1496,6 @@ fun EncryptedVideoPlayer(
     val displayMetrics = context.resources.displayMetrics
     val screenH = displayMetrics.heightPixels.toFloat()
 
-    // NGƯỠNG MỚI THẤP HƠN NHIỀU (15% chiều cao màn hình)
     val dismissThreshold = screenH * 0.15f
 
     val gestureModifier = Modifier.pointerInput(Unit) {
@@ -1257,16 +1528,14 @@ fun EncryptedVideoPlayer(
                         if (!isDraggingToDismiss) onDismissDragStart()
                         isDraggingToDismiss = true
 
-                        // Cập nhật cả trục Y và trục X
                         gestureOffsetY += delta.y
                         gestureOffsetX += delta.x
 
-                        // THU NHỎ KHI KÉO: tối đa giảm về 60%
                         val swipeProgress = (kotlin.math.abs(gestureOffsetY) / (screenH * 0.8f)).coerceIn(0f, 1f)
                         gestureScale = (1f - (swipeProgress * 0.4f)).coerceAtLeast(0.6f)
 
                         coroutineScope.launch {
-                            offsetX.snapTo(gestureOffsetX) // Snap theo trục X
+                            offsetX.snapTo(gestureOffsetX)
                             offsetY.snapTo(gestureOffsetY)
                             scale.snapTo(gestureScale)
                         }
@@ -1282,9 +1551,8 @@ fun EncryptedVideoPlayer(
                 if (offsetY.value > dismissThreshold) {
                     onDismiss(scale.value, offsetX.value, offsetY.value)
                 } else {
-                    // HỦY VUỐT TRẢ VỀ BAN ĐẦU + KHÔI PHỤC HDR
                     onDismissDragCancel()
-                    coroutineScope.launch { offsetX.animateTo(0f, spring()) } // Trả trục X về 0
+                    coroutineScope.launch { offsetX.animateTo(0f, spring()) }
                     coroutineScope.launch { offsetY.animateTo(0f, spring()) }
                     coroutineScope.launch { scale.animateTo(1f, spring()) }
                 }
@@ -1297,7 +1565,6 @@ fun EncryptedVideoPlayer(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            // KHỚP CÔNG THỨC ALPHA: Đồng bộ với Lớp 2 phía trên
             .background(Color.Black.copy(alpha = (1f - (kotlin.math.abs(offsetY.value) / (screenH / 2f))).coerceIn(0f, 1f)))
             .then(gestureModifier)
             .testTag("video_player_container"),
@@ -1307,25 +1574,27 @@ fun EncryptedVideoPlayer(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center
         ) {
-            AndroidView(
-                factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        useController = false
-                        player = exoPlayer
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxSize()
-                    .graphicsLayer(
-                        scaleX = scale.value,
-                        scaleY = scale.value,
-                        translationX = offsetX.value,
-                        translationY = offsetY.value
-                    )
-                    .testTag("exoplayer_surface_view")
-            )
+            if (isInteractive && exoPlayer != null) {
+                AndroidView(
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            useController = false
+                            player = exoPlayer
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale.value,
+                            scaleY = scale.value,
+                            translationX = offsetX.value,
+                            translationY = offsetY.value
+                        )
+                        .testTag("exoplayer_surface_view")
+                )
+            }
 
-            if (!isVideoReady && placeholderBitmap != null) {
+            if ((!isVideoReady || exoPlayer == null) && placeholderBitmap != null) {
                 Image(
                     bitmap = placeholderBitmap,
                     contentDescription = null,
@@ -1341,9 +1610,9 @@ fun EncryptedVideoPlayer(
                 )
             }
 
-            if (!isPlaying && showControls) {
+            if (!isPlaying && showControls && exoPlayer != null) {
                 IconButton(
-                    onClick = { exoPlayer.play() },
+                    onClick = { exoPlayer?.play() },
                     modifier = Modifier
                         .size(64.dp)
                         .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(32.dp))
@@ -1359,7 +1628,7 @@ fun EncryptedVideoPlayer(
         }
 
         AnimatedVisibility(
-            visible = showControls,
+            visible = showControls && exoPlayer != null,
             enter = fadeIn() + slideInVertically(initialOffsetY = { it }),
             exit = fadeOut() + slideOutVertically(targetOffsetY = { it }),
             modifier = Modifier
@@ -1386,7 +1655,7 @@ fun EncryptedVideoPlayer(
 
                         Slider(
                             value = currentPosition.toFloat(),
-                            onValueChange = { exoPlayer.seekTo(it.toLong()) },
+                            onValueChange = { exoPlayer?.seekTo(it.toLong()) },
                             valueRange = 0f..(duration.toFloat().coerceAtLeast(1f)),
                             colors = SliderDefaults.colors(
                                 activeTrackColor = MaterialTheme.colorScheme.primary,
@@ -1409,7 +1678,7 @@ fun EncryptedVideoPlayer(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        IconButton(onClick = { exoPlayer.seekTo((exoPlayer.currentPosition - 10000).coerceAtLeast(0L)) }) {
+                        IconButton(onClick = { exoPlayer?.seekTo((exoPlayer!!.currentPosition - 10000).coerceAtLeast(0L)) }) {
                             Icon(imageVector = Icons.Filled.Replay10, contentDescription = "Rewind 10s", tint = Color.White)
                         }
 
@@ -1417,7 +1686,7 @@ fun EncryptedVideoPlayer(
 
                         IconButton(
                             onClick = {
-                                if (isPlaying) exoPlayer.pause() else exoPlayer.play()
+                                if (isPlaying) exoPlayer?.pause() else exoPlayer?.play()
                             },
                             modifier = Modifier
                                 .size(48.dp)
@@ -1433,7 +1702,7 @@ fun EncryptedVideoPlayer(
 
                         Spacer(modifier = Modifier.width(16.dp))
 
-                        IconButton(onClick = { exoPlayer.seekTo((exoPlayer.currentPosition + 10000).coerceAtMost(duration)) }) {
+                        IconButton(onClick = { exoPlayer?.seekTo((exoPlayer!!.currentPosition + 10000).coerceAtMost(duration)) }) {
                             Icon(imageVector = Icons.Filled.Forward10, contentDescription = "Forward 10s", tint = Color.White)
                         }
                     }
@@ -1448,20 +1717,6 @@ private fun formatTime(millis: Long): String {
     val minutes = totalSeconds / 60
     val seconds = totalSeconds % 60
     return "%02d:%02d".format(minutes, seconds)
-}
-
-private fun calculateInSampleSize(options: BitmapFactory.Options, reqWidth: Int, reqHeight: Int): Int {
-    val height = options.outHeight
-    val width = options.outWidth
-    var inSampleSize = 1
-    if (height > reqHeight || width > reqWidth) {
-        val halfHeight = height / 2
-        val halfWidth = width / 2
-        while (halfHeight / inSampleSize >= reqHeight && halfWidth / inSampleSize >= reqWidth) {
-            inSampleSize *= 2
-        }
-    }
-    return inSampleSize
 }
 
 private fun lerp(start: Float, stop: Float, fraction: Float): Float {
