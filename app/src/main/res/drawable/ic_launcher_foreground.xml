@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Padlock Shackle -->
+    <path
+        android:strokeWidth="5.5"
+        android:strokeColor="#FFC107"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M38,44 V34 C38,25 45,18 54,18 C63,18 70,25 70,34 V44" />
+        
+    <!-- Padlock Body -->
+    <path
+        android:fillColor="#FFD54F"
+        android:pathData="M30,44 H78 C82,44 85,47 85,51 V81 C85,85 82,88 78,88 H30 C26,88 23,85 23,81 V51 C23,47 26,44 30,44 Z" />
+
+    <!-- Camera/Lens motif inside padlock body (combining safety lock & photo gallery) -->
+    <path
+        android:fillColor="#1A1C1E"
+        android:pathData="M54,54 C48.5,54 44,58.5 44,64 C44,69.5 48.5,74 54,74 C59.5,74 64,69.5 64,64 C64,58.5 59.5,54 54,54 Z M54,70 C50.7,70 48,67.3 48,64 C48,60.7 50.7,58 54,58 C57.3,58 60,60.7 60,64 C60,67.3 57.3,70 54,70 Z" />
+
+    <!-- Camera Flash dot -->
+    <path
+        android:fillColor="#FFC107"
+        android:pathData="M69,53 H73 V57 H69 Z" />
+</vector>

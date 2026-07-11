@@ -1,0 +1,6 @@
+{
+  "name": "Secret Gallery",
+  "description": "Zero-knowledge, completely stateless offline Android Secret Gallery with high-performance AES-256-GCM encrypted media viewer supporting Dolby Vision / 4K HDR videos and Ultra HDR images.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
