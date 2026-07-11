@@ -1,6 +1,5 @@
 package com.example.coil
 
-import android.content.Context
 import android.net.Uri
 import coil.ImageLoader
 import coil.decode.DataSource
@@ -9,7 +8,7 @@ import coil.fetch.FetchResult
 import coil.fetch.Fetcher
 import coil.fetch.SourceResult
 import coil.request.Options
-import com.example.crypto.BlockDecryptingInputStream
+import com.example.crypto.CryptoEngine
 import okio.buffer
 import okio.source
 
@@ -20,24 +19,29 @@ class EncryptedUriFetcher(
 ) : Fetcher {
 
     override suspend fun fetch(): FetchResult? {
-        val rawInputStream = options.context.contentResolver.openInputStream(uri)
+        val tierParam = uri.getQueryParameter("tier") ?: "FULL"
+        val tier = when(tierParam) {
+            "THUMB" -> CryptoEngine.Tier.THUMB
+            "SCREEN" -> CryptoEngine.Tier.SCREEN
+            else -> CryptoEngine.Tier.FULL
+        }
+
+        val decryptedStream = CryptoEngine.getSgv2TierStream(options.context, uri, tier, dek)
             ?: return null
-        
-        val decryptedStream = BlockDecryptingInputStream(rawInputStream, dek)
+
         val bufferedSource = decryptedStream.source().buffer()
 
         return SourceResult(
             source = ImageSource(bufferedSource, options.context),
-            mimeType = null, // Let Coil inspect the stream signature (PNG, JPEG, Ultra HDR, etc.) dynamically
+            mimeType = null,
             dataSource = DataSource.DISK
         )
     }
 
     class Factory(private val dek: ByteArray) : Fetcher.Factory<Uri> {
         override fun create(data: Uri, options: Options, imageLoader: ImageLoader): Fetcher? {
-            val path = data.path ?: ""
             val uriStr = data.toString()
-            if (path.endsWith(".enc") || path.contains("_thumb.enc") || uriStr.contains(".enc")) {
+            if (uriStr.contains(".enc")) {
                 return EncryptedUriFetcher(data, options, dek)
             }
             return null

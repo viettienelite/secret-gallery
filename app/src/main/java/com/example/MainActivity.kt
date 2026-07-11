@@ -6,7 +6,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.Box
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.collectAsState
@@ -29,26 +28,16 @@ class MainActivity : ComponentActivity() {
         vaultViewModel.loadSavedVaultUri(this)
         enableEdgeToEdge()
 
-        // Configure system bars to be shown by default for edge-to-edge drawing
+        // Ẩn vĩnh viễn Status Bar trên Activity chính
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-        windowInsetsController.show(WindowInsetsCompat.Type.systemBars())
         windowInsetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        windowInsetsController.hide(WindowInsetsCompat.Type.statusBars())
 
         setContent {
             MyApplicationTheme {
                 val vaultUri by vaultViewModel.vaultUri.collectAsState()
                 val dek by vaultViewModel.dek.collectAsState()
                 val selectedMedia by vaultViewModel.selectedMedia.collectAsState()
-
-                // Dynamically hide/show system bars based on full-screen viewer state
-                androidx.compose.runtime.LaunchedEffect(selectedMedia) {
-                    val controller = WindowCompat.getInsetsController(window, window.decorView)
-                    if (selectedMedia != null) {
-                        controller.hide(WindowInsetsCompat.Type.systemBars())
-                    } else {
-                        controller.show(WindowInsetsCompat.Type.systemBars())
-                    }
-                }
 
                 Scaffold(
                     modifier = Modifier.fillMaxSize()

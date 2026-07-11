@@ -29,6 +29,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Image
+import coil.request.ImageRequest
+import coil.size.Size
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
@@ -375,9 +377,16 @@ fun GalleryGridItem(
 ) {
     var itemBounds by remember { mutableStateOf<FloatArray?>(null) }
 
-    val painter = if (item.thumbUri != null && imageLoader != null) {
+    // Trong Composable GalleryGridItem, thay đổi painter thành:
+    val thumbUriWithTier = item.uri.buildUpon().appendQueryParameter("tier", "THUMB").build()
+    val painter = if (imageLoader != null) {
         rememberAsyncImagePainter(
-            model = item.thumbUri,
+            model = ImageRequest.Builder(LocalContext.current)
+                .data(thumbUriWithTier)
+                // ÉP COIL GIỮ NGUYÊN KÍCH THƯỚC GỐC CỦA THUMBNAIL TỪ FILE
+                // KHÔNG cho phép Coil dùng chế độ FIT để bóp méo ảnh trước khi giao cho Compose
+                .size(Size.ORIGINAL)
+                .build(),
             imageLoader = imageLoader
         )
     } else null
