@@ -270,9 +270,9 @@ fun GalleryScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .testTag("gallery_grid"),
-                    contentPadding = PaddingValues(vertical = 2.dp), // Bỏ padding ngang, giữ padding dọc
-                    horizontalArrangement = Arrangement.spacedBy(2.dp), // Giảm khoảng cách còn 1 nửa
-                    verticalArrangement = Arrangement.spacedBy(2.dp)  // Giảm khoảng cách còn 1 nửa
+                    contentPadding = PaddingValues(vertical = 1.dp), // Bỏ padding ngang, giữ padding dọc
+                    horizontalArrangement = Arrangement.spacedBy(1.dp), // Giảm khoảng cách còn 1 nửa
+                    verticalArrangement = Arrangement.spacedBy(1.dp)  // Giảm khoảng cách còn 1 nửa
                 ) {
                     groupedItems.forEach { (dateKey, itemsInGroup) ->
                         // Add Date Section Header spanning all 5 columns
