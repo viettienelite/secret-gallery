@@ -211,13 +211,13 @@ class VaultViewModel : ViewModel() {
         }
     }
 
+    // Trong file VaultViewModel.kt
     private fun generateTierBitmaps(context: Context, uri: Uri, isVideo: Boolean): Pair<ByteArray, ByteArray> {
         val baseBmp = if (isVideo) {
             val retriever = MediaMetadataRetriever()
             retriever.setDataSource(context, uri)
             retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
         } else {
-            // Load base bitmap an toàn chống OOM
             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
             val decodeOptions = BitmapFactory.Options().apply {
@@ -230,21 +230,31 @@ class VaultViewModel : ViewModel() {
         val bw = baseBmp.width
         val bh = baseBmp.height
 
-        // 1. TẠO TIER SCREEN TRƯỚC (Chiều rộng tối đa 1080)
+        // 1. TẠO TIER SCREEN (Giữ nguyên 1080)
         val screenScale = if (bw > 0) 1080f / bw else 1f
         val screenW = minOf(1080, bw)
         val screenH = (bh * (screenW.toFloat() / bw)).toInt().coerceAtLeast(1)
         val screenBmp = Bitmap.createScaledBitmap(baseBmp, screenW, screenH, true)
 
-        // 2. TẠO TIER THUMB TỪ TIER SCREEN (Sử dụng Step-down Scaling để làm "mềm" ảnh)
+        // 2. TẠO TIER THUMB (Giữ nguyên 216)
         val thumbBmp = createSmoothThumbnail(screenBmp, 216)
 
-        val thumbBaos = ByteArrayOutputStream()
-        thumbBmp.compress(Bitmap.CompressFormat.JPEG, 85, thumbBaos)
-        val screenBaos = ByteArrayOutputStream()
-        screenBmp.compress(Bitmap.CompressFormat.JPEG, 85, screenBaos)
+        // 3. CHUYỂN ĐỔI SANG WEBP VÀ QUALITY 75
+        val compressFormat = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            Bitmap.CompressFormat.WEBP_LOSSY
+        } else {
+            @Suppress("DEPRECATION")
+            Bitmap.CompressFormat.WEBP
+        }
 
-        // Dọn dẹp memory ngay lập tức nếu cần thiết
+        val targetQuality = 75
+
+        val thumbBaos = ByteArrayOutputStream()
+        thumbBmp.compress(compressFormat, targetQuality, thumbBaos)
+
+        val screenBaos = ByteArrayOutputStream()
+        screenBmp.compress(compressFormat, targetQuality, screenBaos)
+
         if (baseBmp != screenBmp && !isVideo) baseBmp.recycle()
         thumbBmp.recycle()
         screenBmp.recycle()

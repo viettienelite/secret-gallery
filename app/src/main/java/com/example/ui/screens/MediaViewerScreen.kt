@@ -363,7 +363,7 @@ fun MediaViewerScreen(
                 progress.animateTo(
                     targetValue = 0f,
                     animationSpec = spring(
-                        stiffness = 400f,
+                        stiffness = 600f,
                         dampingRatio = 1.0f,
                         visibilityThreshold = 0.0001f
                     )
@@ -374,9 +374,13 @@ fun MediaViewerScreen(
                 dragY = 0f
 
                 keepPagerAlive = false
-                closeTransitionAlpha.snapTo(1f)
                 isClosing = false
                 viewModel.setAnimatingItem(null)
+
+                // 2. Chờ 15ms (~1 render frame) để Compose kịp vẽ thumb dưới grid
+                delay(15L)
+
+                // 3. Cuối cùng mới tháo dỡ hoàn toàn MediaViewerScreen (và Canvas)
                 viewModel.selectMedia(null)
             }
         }
@@ -610,10 +614,13 @@ fun MediaViewerScreen(
             }
         }
 
+        // Trong file MediaViewerScreen.kt
         LaunchedEffect(pagerState.currentPage) {
             val activeItem = items.getOrNull(pagerState.currentPage)
             if (activeItem != null) {
                 viewModel.selectMedia(activeItem)
+                // THÊM DÒNG NÀY: Cập nhật thumb nào sẽ tàng hình trong Grid
+                viewModel.setAnimatingItem(activeItem.encryptedName)
             }
             pagerScrollEnabled = true
         }
