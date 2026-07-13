@@ -45,6 +45,15 @@ class VaultViewModel : ViewModel() {
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
 
+    private val _importProgress = MutableStateFlow(0f)
+    val importProgress: StateFlow<Float> = _importProgress.asStateFlow()
+
+    private val _importQueueTotal = MutableStateFlow(0)
+    val importQueueTotal: StateFlow<Int> = _importQueueTotal.asStateFlow()
+
+    private val _importQueueIndex = MutableStateFlow(0)
+    val importQueueIndex: StateFlow<Int> = _importQueueIndex.asStateFlow()
+
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
 
@@ -168,47 +177,99 @@ class VaultViewModel : ViewModel() {
         return result.sortedByDescending { it.dateTaken }
     }
 
+    /** Import 1 file duy nhất - giữ lại để tương thích ngược, chỉ là wrapper gọi importMultipleMedia. */
     fun importMedia(context: Context, sourceUri: Uri) {
+        importMultipleMedia(context, listOf(sourceUri))
+    }
+
+    /**
+     * Import nhiều file cùng lúc. Cả hàng đợi dùng chung 1 trạng thái _isLoading duy nhất
+     * (không bật/tắt qua lại giữa các file) để overlay không bị chớp (flicker) khi chuyển file.
+     * File lỗi sẽ bị bỏ qua và gộp báo lỗi ở cuối, không làm dừng cả hàng đợi.
+     */
+    fun importMultipleMedia(context: Context, sourceUris: List<Uri>) {
         val vaultUriVal = _vaultUri.value ?: return
         val key = _dek.value ?: return
+        if (sourceUris.isEmpty()) return
 
         viewModelScope.launch {
             _isLoading.value = true
+            _importProgress.value = 0f
+            _importQueueTotal.value = sourceUris.size
+            _importQueueIndex.value = 0
             _error.value = null
+
+            val failedNames = mutableListOf<String>()
+            val totalFiles = sourceUris.size
+
             try {
                 withContext(Dispatchers.IO) {
-                    val originalName = getFileNameFromUri(context, sourceUri) ?: "import_${System.currentTimeMillis()}"
-                    val isVideo = isVideoFile(originalName)
-
-                    // Sử dụng hàm getActualDateTaken đọc thẳng từ EXIF/Video Metadata
-                    val dateTaken = getActualDateTaken(context, sourceUri, isVideo)
-
-                    val combinedMetadata = "$dateTaken|$originalName"
-                    val encryptedName = CryptoEngine.encryptFileName(combinedMetadata, key)
-
-                    val encryptedFileUri = CryptoEngine.createChildFile(context, vaultUriVal, encryptedName)
-                        ?: throw java.io.IOException("Could not create SGV2 file in Vault")
-
-                    // Khởi tạo 2 tier resize (Thumbnail & Screen)
-                    val (thumbBytes, screenBytes) = generateTierBitmaps(context, sourceUri, isVideo)
-
-                    // Lưu toàn bộ 3 Tier gộp 1 File
-                    CryptoEngine.encryptSgv2File(
-                        context = context,
-                        sourceUri = sourceUri,
-                        destUri = encryptedFileUri,
-                        thumbBytes = thumbBytes,
-                        screenBytes = screenBytes,
-                        dek = key
-                    )
+                    sourceUris.forEachIndexed { index, sourceUri ->
+                        _importQueueIndex.value = index + 1
+                        try {
+                            // Gộp % của từng file vào 1 thanh tiến độ tổng duy nhất cho cả hàng đợi:
+                            // progress hiển thị = (số file đã xong + % file đang chạy) / tổng số file,
+                            // nên thanh tiến độ luôn tăng dần liên tục từ 0% -> 100%, không bị "nhảy về 0"
+                            // mỗi khi bắt đầu một file mới.
+                            importSingleFile(context, vaultUriVal, key, sourceUri) { fileProgress ->
+                                _importProgress.value = (index + fileProgress) / totalFiles
+                            }
+                        } catch (e: Exception) {
+                            failedNames.add(getFileNameFromUri(context, sourceUri) ?: sourceUri.toString())
+                            // File lỗi vẫn được tính là "đã xong" để thanh tiến độ tổng tiếp tục nhảy
+                            // đúng mốc của file kế tiếp thay vì đứng yên.
+                            _importProgress.value = (index + 1f) / totalFiles
+                        }
+                    }
                 }
                 loadVaultItems(context)
+                if (failedNames.isNotEmpty()) {
+                    _error.value = if (failedNames.size == 1) {
+                        "Failed to import: ${failedNames.first()}"
+                    } else {
+                        "Failed to import ${failedNames.size} of ${sourceUris.size} files"
+                    }
+                }
             } catch (e: Exception) {
                 _error.value = "Import failed: ${e.message}"
             } finally {
                 _isLoading.value = false
+                _importProgress.value = 0f
+                _importQueueTotal.value = 0
+                _importQueueIndex.value = 0
             }
         }
+    }
+
+    /** Mã hoá & lưu 1 file vào vault (chạy trên Dispatchers.IO). Ném exception nếu lỗi để hàm gọi xử lý tiếp file kế tiếp. */
+    private fun importSingleFile(context: Context, vaultUriVal: Uri, key: ByteArray, sourceUri: Uri, onProgress: (Float) -> Unit) {
+        val originalName = getFileNameFromUri(context, sourceUri) ?: "import_${System.currentTimeMillis()}"
+        val isVideo = isVideoFile(originalName)
+        val sourceSize = getFileSizeFromUri(context, sourceUri)
+
+        // Sử dụng hàm getActualDateTaken đọc thẳng từ EXIF/Video Metadata
+        val dateTaken = getActualDateTaken(context, sourceUri, isVideo)
+
+        val combinedMetadata = "$dateTaken|$originalName"
+        val encryptedName = CryptoEngine.encryptFileName(combinedMetadata, key)
+
+        val encryptedFileUri = CryptoEngine.createChildFile(context, vaultUriVal, encryptedName)
+            ?: throw java.io.IOException("Could not create SGV2 file in Vault")
+
+        // Khởi tạo 2 tier resize (Thumbnail & Screen)
+        val (thumbBytes, screenBytes) = generateTierBitmaps(context, sourceUri, isVideo)
+
+        // Lưu toàn bộ 3 Tier gộp 1 File, báo % tiến độ khi mã hoá block Full-tier
+        CryptoEngine.encryptSgv2File(
+            context = context,
+            sourceUri = sourceUri,
+            destUri = encryptedFileUri,
+            thumbBytes = thumbBytes,
+            screenBytes = screenBytes,
+            dek = key,
+            sourceSize = sourceSize,
+            onProgress = { progress -> onProgress(progress) }
+        )
     }
 
     // Trong file VaultViewModel.kt
@@ -314,6 +375,27 @@ class VaultViewModel : ViewModel() {
         } catch (e: Exception) {}
         if (name == null) name = uri.lastPathSegment
         return name
+    }
+
+    /** Lấy kích thước gốc (byte) của file nguồn để tính % tiến độ mã hoá. Trả -1 nếu không xác định được. */
+    private fun getFileSizeFromUri(context: Context, uri: Uri): Long {
+        var size = -1L
+        try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (idx != -1 && !cursor.isNull(idx)) size = cursor.getLong(idx)
+                }
+            }
+        } catch (e: Exception) {}
+        if (size <= 0L) {
+            try {
+                context.contentResolver.openAssetFileDescriptor(uri, "r")?.use { afd ->
+                    if (afd.length >= 0) size = afd.length
+                }
+            } catch (e: Exception) {}
+        }
+        return size
     }
 
     /**

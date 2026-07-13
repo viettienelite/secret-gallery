@@ -1,9 +1,17 @@
 package com.example.ui.screens
 
+import android.app.Activity
 import android.net.Uri
+import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -128,6 +136,9 @@ fun GalleryScreen(
     val vaultUri by viewModel.vaultUri.collectAsState()
     val dek by viewModel.dek.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    val importProgress by viewModel.importProgress.collectAsState()
+    val importQueueTotal by viewModel.importQueueTotal.collectAsState()
+    val importQueueIndex by viewModel.importQueueIndex.collectAsState()
     val error by viewModel.error.collectAsState()
     val animatingItem by viewModel.animatingItem.collectAsState()
 
@@ -142,12 +153,19 @@ fun GalleryScreen(
         }
     }
 
-    // SAF File Picker to import media (*/* but we check image/video)
+    // SAF File Picker to import media (*/* but we check image/video) - hỗ trợ chọn NHIỀU file cùng lúc
     val importLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        if (uri != null) {
-            viewModel.importMedia(context, uri)
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri> ->
+        // Tắt animation mặc định của hệ điều hành ngay khi Document Picker đóng lại và quay về
+        // đây (máy chạy Android < 14 - máy >= 14 đã được xử lý bằng overrideActivityTransition
+        // trong MainActivity), tránh xung đột với animation Compose tự vẽ của popup tiến trình.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            @Suppress("DEPRECATION")
+            (context as? Activity)?.overridePendingTransition(0, 0)
+        }
+        if (uris.isNotEmpty()) {
+            viewModel.importMultipleMedia(context, uris)
         }
     }
 
@@ -334,29 +352,92 @@ fun GalleryScreen(
                 }
             }
 
-            // Loading overlay
-            if (isLoading) {
+            // Loading overlay - dùng AnimatedVisibility (chỉ fade) cho lớp nền đen toàn màn hình,
+            // và graphicsLayer scale RIÊNG cho mỗi cái Card nhỏ bên trong.
+            //
+            // FIX BUG "nền đen phóng to lên" (trước đây tưởng là animation window của hệ điều
+            // hành can thiệp, nhưng thực chất KHÔNG PHẢI): scaleIn/scaleOut cũ được đặt trên
+            // AnimatedVisibility bọc NGOÀI CÙNG - tức là bọc luôn cả Box nền đen fillMaxSize().
+            // Nghĩa là mỗi khi overlay xuất hiện/biến mất, TOÀN BỘ lớp phủ đen full màn hình cũng
+            // bị scale từ 92% -> 100% theo, tạo đúng cảm giác "cả màn hình đen phóng to lên" mà
+            // không hề có animation OS nào chen vào cả - đó là animation tự viết nhưng đặt sai chỗ.
+            // Giờ tách riêng: lớp đen ngoài cùng CHỈ fade (không scale bao giờ), còn hiệu ứng
+            // "pop" (scale nhẹ 92% -> 100%) chỉ áp dụng cho đúng cái Card nhỏ ở giữa.
+            AnimatedVisibility(
+                visible = isLoading,
+                enter = fadeIn(animationSpec = tween(200)),
+                exit = fadeOut(animationSpec = tween(150))
+            ) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .background(Color.Black.copy(alpha = 0.5f)),
                     contentAlignment = Alignment.Center
                 ) {
+                    val cardScale by animateFloatAsState(
+                        targetValue = if (isLoading) 1f else 0.92f,
+                        animationSpec = tween(durationMillis = if (isLoading) 200 else 150),
+                        label = "import_progress_card_scale"
+                    )
                     Card(
+                        modifier = Modifier.graphicsLayer {
+                            scaleX = cardScale
+                            scaleY = cardScale
+                        },
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                     ) {
                         Column(
-                            modifier = Modifier.padding(24.dp),
+                            modifier = Modifier
+                                .padding(24.dp)
+                                .widthIn(min = 200.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                            Box(
+                                modifier = Modifier.size(64.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (importProgress > 0f) {
+                                    // Đã biết kích thước file -> vòng tròn tiến độ xác định (determinate) kèm %
+                                    CircularProgressIndicator(
+                                        progress = { importProgress },
+                                        modifier = Modifier.size(64.dp),
+                                        color = MaterialTheme.colorScheme.primary,
+                                        trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                                        strokeWidth = 4.dp
+                                    )
+                                    Text(
+                                        text = "${(importProgress * 100).toInt()}%",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                } else {
+                                    // Đang chuẩn bị (đọc metadata, tạo thumbnail...) -> vòng tròn indeterminate
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(64.dp),
+                                        color = MaterialTheme.colorScheme.primary,
+                                        strokeWidth = 4.dp
+                                    )
+                                }
+                            }
                             Spacer(modifier = Modifier.height(16.dp))
                             Text(
-                                text = "Encrypting media blocks...",
+                                text = if (importProgress > 0f) "Encrypting media blocks..." else "Preparing file...",
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
                             )
+                            // Chỉ hiện số thứ tự file khi đang import nhiều hơn 1 file
+                            if (importQueueTotal > 1) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "File $importQueueIndex / $importQueueTotal",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
                         }
                     }
                 }

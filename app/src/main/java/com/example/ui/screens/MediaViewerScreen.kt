@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.ImageDecoder
 import android.media.MediaMetadataRetriever
 import android.view.Gravity
 import android.view.WindowManager
@@ -129,6 +130,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.nio.ByteBuffer
 
 // ------------------------------------------------------------------------------------
 // CACHE BITMAP TIER "FULL" - RIÊNG THEO TỪNG ITEM (encryptedName).
@@ -1070,11 +1072,35 @@ fun EncryptedImageViewer(
                         // decodeByteArray trên buffer đã đầy đủ - không còn phụ thuộc hành vi
                         // mark/reset/skip của stream giải mã nữa nên không thể bị đọc thiếu.
                         val bytes = stream.readBytes()
-                        val options = BitmapFactory.Options().apply {
-                            inPreferredConfig = Bitmap.Config.ARGB_8888
-                            inJustDecodeBounds = false
+                        // FIX BUG "mất HDR ở ảnh full": BitmapFactory.decodeByteArray() (Skia cũ)
+                        // KHÔNG đọc gain map Ultra HDR - dù file gốc có HDR, bitmap giải mã ra luôn
+                        // là SDR thường, nên dù window đã bật colorMode HDR (xem isHdrActive ở trên)
+                        // cũng không còn dữ liệu HDR nào để hiển thị. ImageDecoder (API 28+) đọc và
+                        // gắn kèm Gainmap vào Bitmap khi ảnh nguồn có Ultra HDR (Android 14+), giữ
+                        // đúng những gì Tier FULL đã lưu nguyên byte không qua decode lúc import.
+                        val finalBmp = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                            try {
+                                val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+                                ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                                    decoder.isMutableRequired = false
+                                }
+                            } catch (e: Exception) {
+                                // Fallback nếu ImageDecoder không đọc được (định dạng lạ/hỏng) - mất HDR
+                                // nhưng vẫn hiển thị được ảnh SDR thay vì trắng tay hoàn toàn.
+                                val options = BitmapFactory.Options().apply {
+                                    inPreferredConfig = Bitmap.Config.ARGB_8888
+                                    inJustDecodeBounds = false
+                                }
+                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+                            }
+                        } else {
+                            val options = BitmapFactory.Options().apply {
+                                inPreferredConfig = Bitmap.Config.ARGB_8888
+                                inJustDecodeBounds = false
+                            }
+                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
                         }
-                        val finalBmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
                         if (finalBmp != null) {
                             val imgBmp = finalBmp.asImageBitmap()
                             FullBitmapCache.put(item.encryptedName, imgBmp)
@@ -1364,6 +1390,15 @@ fun EncryptedImageViewer(
             // LỚP NỀN: Screen tier (qua Coil) hoặc Thumbnail cache của CHÍNH trang này. Luôn vẽ
             // lớp này trước để không bao giờ có 1 frame "trắng tay" trong lúc chờ FULL giải mã -
             // đây là phần trực tiếp chống hiện tượng đen/cắt cụt khi chuyển trang.
+            // QUAN TRỌNG (fix mất HDR): trước đây crossfade được làm bằng cách animate alpha của
+            // CHÍNH lớp FULL (ảnh HDR/gain map). Nền tảng Android chỉ vẽ HDR/gain map khi bitmap
+            // được vẽ KHÔNG qua alpha-compositing (alpha phải luôn = 1) - hễ đặt alpha < 1 (kể cả
+            // trong lúc animate) là hệ thống fallback về composite SDR thường, và một khi lớp đó
+            // đã phải render qua đường offscreen alpha-blend thì HDR coi như mất hẳn dù sau đó
+            // alpha có quay lại đúng 1.0. Nên giờ đảo ngược: lớp SDR (screen/placeholder) phía
+            // dưới mới là lớp được animate mờ dần đi, còn lớp FULL (HDR) phía trên luôn vẽ ở
+            // alpha cố định = 1f, không bao giờ đi qua nhánh alpha-blend.
+            val screenTierAlpha = 1f - fullImageAlpha.value
             val tierScreenUri = remember(item.uri) {
                 item.uri.buildUpon().appendQueryParameter("tier", "SCREEN").build()
             }
@@ -1385,7 +1420,8 @@ fun EncryptedImageViewer(
                             scaleX = scale.value,
                             scaleY = scale.value,
                             translationX = offsetX.value,
-                            translationY = offsetY.value
+                            translationY = offsetY.value,
+                            alpha = screenTierAlpha
                         )
                         .testTag("encrypted_image"),
                     contentScale = ContentScale.Fit
@@ -1400,15 +1436,17 @@ fun EncryptedImageViewer(
                             scaleX = scale.value,
                             scaleY = scale.value,
                             translationX = offsetX.value,
-                            translationY = offsetY.value
+                            translationY = offsetY.value,
+                            alpha = screenTierAlpha
                         )
                         .testTag("encrypted_image"),
                     contentScale = ContentScale.Fit
                 )
             }
 
-            // LỚP PHỦ: ảnh FULL SIZE của CHÍNH trang này, crossfade nhẹ lên trên lớp nền khi
-            // giải mã xong (hoặc hiện ngay nếu đã có trong FullBitmapCache từ lần xem trước).
+            // LỚP PHỦ: ảnh FULL SIZE (HDR) của CHÍNH trang này. Luôn vẽ ở alpha = 1f cố định (KHÔNG
+            // graphicsLayer alpha động) để giữ đúng đường vẽ trực tiếp mà nền tảng cần cho gain map
+            // Ultra HDR - hiệu ứng "crossfade" giờ đến từ lớp SCREEN phía dưới mờ dần đi ở trên.
             val currentFullBitmap = fullBitmap
             if (currentFullBitmap != null) {
                 Image(
@@ -1420,8 +1458,7 @@ fun EncryptedImageViewer(
                             scaleX = scale.value,
                             scaleY = scale.value,
                             translationX = offsetX.value,
-                            translationY = offsetY.value,
-                            alpha = fullImageAlpha.value
+                            translationY = offsetY.value
                         )
                         .testTag("encrypted_image_full"),
                     contentScale = ContentScale.Fit
