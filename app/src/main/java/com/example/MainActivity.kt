@@ -1,5 +1,6 @@
 package com.example
 
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -27,6 +28,20 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         vaultViewModel.loadSavedVaultUri(this)
         enableEdgeToEdge()
+
+        // Tắt animation mặc định của hệ điều hành khi Activity này chuyển cảnh (mở Document
+        // Picker để import nhiều file, rồi quay lại). Animation hệ thống (phóng to/mờ dần nền
+        // đen) chạy song song và đè lên animation Compose tự vẽ (AnimatedVisibility) của popup
+        // tiến trình import, gây ra hiệu ứng "nền đen phóng to lên" người dùng thấy. Từ giờ chỉ
+        // còn animation do chính app tự viết (trong GalleryScreen) đảm nhiệm việc này.
+        window.setWindowAnimations(0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, 0, 0)
+        } else {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
+        }
 
         // Ẩn vĩnh viễn Status Bar trên Activity chính
         val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
@@ -69,6 +84,17 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // overridePendingTransition() (API < 34) chỉ áp dụng cho lượt chuyển cảnh kế tiếp, nên
+        // cần gọi lại mỗi lần quay lại Activity (ví dụ sau khi đóng Document Picker) để animation
+        // hệ thống luôn bị tắt, không riêng gì lần khởi động đầu tiên.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(0, 0)
         }
     }
 }

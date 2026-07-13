@@ -19,7 +19,7 @@ import org.json.JSONObject
 
 object CryptoEngine {
     private const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
-    private const val ITERATIONS = 10000
+    private const val ITERATIONS = 600000
     private const val KEY_LENGTH = 256
     private const val BLOCK_SIZE = 4096
     private const val TAG_SIZE_BITS = 128
@@ -155,7 +155,9 @@ object CryptoEngine {
         destUri: Uri,
         thumbBytes: ByteArray,
         screenBytes: ByteArray,
-        dek: ByteArray
+        dek: ByteArray,
+        sourceSize: Long = -1L,
+        onProgress: ((Float) -> Unit)? = null
     ) {
         val thumbCipher = encryptBlob(thumbBytes, dek)
         val screenCipher = encryptBlob(screenBytes, dek)
@@ -185,13 +187,19 @@ object CryptoEngine {
 
             // Block-encrypt file Full trực tiếp để giữ EXIF
             context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                encryptFileContent(input, out, dek)
+                encryptFileContent(input, out, dek, sourceSize, onProgress)
             }
         }
     }
 
-    /** Block encryption gốc cho Tier 3 */
-    private fun encryptFileContent(input: InputStream, output: OutputStream, dek: ByteArray) {
+    /** Block encryption gốc cho Tier 3. totalSize/onProgress dùng để báo % tiến độ khi import. */
+    private fun encryptFileContent(
+        input: InputStream,
+        output: OutputStream,
+        dek: ByteArray,
+        totalSize: Long = -1L,
+        onProgress: ((Float) -> Unit)? = null
+    ) {
         val fileNonce = ByteArray(12).apply { SecureRandom().nextBytes(this) }
         output.write(fileNonce)
 
@@ -200,13 +208,27 @@ object CryptoEngine {
         val buffer = ByteArray(BLOCK_SIZE)
         var blockIndex = 0L
         var bytesRead: Int
+        var totalBytesRead = 0L
+        var lastReportedPercent = -1
 
         while (input.read(buffer).also { bytesRead = it } != -1) {
             val blockIv = calculateBlockIv(fileNonce, blockIndex)
             cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(TAG_SIZE_BITS, blockIv))
             output.write(cipher.doFinal(buffer, 0, bytesRead))
             blockIndex++
+            totalBytesRead += bytesRead
+
+            // Chỉ báo tiến độ khi biết tổng kích thước, và chỉ khi % nguyên thay đổi (tránh spam state)
+            if (totalSize > 0 && onProgress != null) {
+                val progress = (totalBytesRead.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f)
+                val percent = (progress * 100).toInt()
+                if (percent != lastReportedPercent) {
+                    lastReportedPercent = percent
+                    onProgress(progress)
+                }
+            }
         }
+        onProgress?.invoke(1f)
     }
 
     /**
