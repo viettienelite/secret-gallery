@@ -2,10 +2,12 @@ package com.example.crypto
 
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.util.Base64
 import java.io.ByteArrayInputStream
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
@@ -29,6 +31,16 @@ object CryptoEngine {
     val SGV2_MAGIC = "SGV2".toByteArray(Charsets.UTF_8)
 
     enum class Tier { THUMB, SCREEN, FULL }
+
+    /**
+     * Thông tin metadata đọc trực tiếp O(1) từ 96-byte Header của SGV2,
+     * giúp hiển thị File Properties tức thì mà không cần giải mã tầng FULL hay tạo file tạm.
+     */
+    data class Sgv2FileInfo(
+        val width: Int,
+        val height: Int,
+        val decryptedSize: Long
+    )
 
     // --- Giữ nguyên các hàm deriveKek, initVault, unlockVault, hasVaultConfig, calculateBlockIv ---
     fun deriveKek(password: String, salt: ByteArray): SecretKeySpec {
@@ -148,6 +160,8 @@ object CryptoEngine {
     /**
      * Tạo file SGV2 chứa cả 3 Tier. Tier Full được đọc trực tiếp từ InputStream để
      * bảo toàn 100% EXIF/Gainmap của file gốc mà không qua decode.
+     * Tận dụng các byte dự phòng trong 64-byte plaintext header để lưu luôn mediaWidth,
+     * mediaHeight và sourceSize (giữ nguyên kích thước 96-byte Fixed Header).
      */
     fun encryptSgv2File(
         context: Context,
@@ -157,16 +171,29 @@ object CryptoEngine {
         screenBytes: ByteArray,
         dek: ByteArray,
         sourceSize: Long = -1L,
+        mediaWidth: Int = 0,
+        mediaHeight: Int = 0,
         onProgress: ((Float) -> Unit)? = null
     ) {
         val thumbCipher = encryptBlob(thumbBytes, dek)
         val screenCipher = encryptBlob(screenBytes, dek)
 
-        // Tạo plaintext header 64 byte
+        // Tạo plaintext header 64 byte:
+        // [0..7]   thumbCipher.size (Long)
+        // [8..15]  screenCipher.size (Long)
+        // [16..19] flags (Int: 1 = có lưu metadata kích thước/dung lượng gốc, 0 = mặc định cũ)
+        // [20..23] mediaWidth (Int)
+        // [24..27] mediaHeight (Int)
+        // [28..35] sourceSize (Long)
+        // [36..63] dự phòng (zero-fill)
+        val hasDimensions = mediaWidth > 0 && mediaHeight > 0
         val headerPlain = ByteBuffer.allocate(64).apply {
             putLong(thumbCipher.size.toLong())
             putLong(screenCipher.size.toLong())
-            putInt(0) // flags dự phòng
+            putInt(if (hasDimensions) 1 else 0)
+            putInt(if (hasDimensions) mediaWidth else 0)
+            putInt(if (hasDimensions) mediaHeight else 0)
+            putLong(if (sourceSize > 0L) sourceSize else 0L)
             // Phần còn lại tự động zero-fill
         }.array()
 
@@ -189,6 +216,65 @@ object CryptoEngine {
             context.contentResolver.openInputStream(sourceUri)?.use { input ->
                 encryptFileContent(input, out, dek, sourceSize, onProgress)
             }
+        }
+    }
+
+    /**
+     * Đọc nhanh thông tin file (width, height, decryptedSize) trong O(1) chỉ từ 96 bytes Header đầu tiên.
+     * Tương thích ngược hoàn toàn với các file SGV2 cũ (trả về width=0, height=0 và decryptedSize tính
+     * chính xác bằng toán học qua getDecryptedLength).
+     */
+    fun readSgv2FileInfo(context: Context, uri: Uri, dek: ByteArray): Sgv2FileInfo? {
+        val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
+        return try {
+            ParcelFileDescriptor.AutoCloseInputStream(pfd).use { fis ->
+                val channel = fis.channel
+                val totalFileSize = channel.size()
+                if (totalFileSize < 96) return null
+
+                val headerBuffer = ByteBuffer.allocate(96)
+                while (headerBuffer.hasRemaining()) {
+                    if (channel.read(headerBuffer) == -1) break
+                }
+                headerBuffer.flip()
+                if (headerBuffer.remaining() < 96) return null
+
+                val magic = ByteArray(4)
+                headerBuffer.get(magic)
+                if (!magic.contentEquals(SGV2_MAGIC)) return null
+
+                val headerNonce = ByteArray(12)
+                headerBuffer.get(headerNonce)
+                val headerCipher = ByteArray(80)
+                headerBuffer.get(headerCipher)
+
+                val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, headerNonce))
+                val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
+
+                val thumbLen = headerPlain.long
+                val screenLen = headerPlain.long
+                val flags = headerPlain.int
+                val width = headerPlain.int
+                val height = headerPlain.int
+                val storedOriginalSize = headerPlain.long
+
+                val offsetFull = 96L + thumbLen + screenLen
+                val fullTierEncryptedSize = (totalFileSize - offsetFull).coerceAtLeast(0L)
+                val realSize = if (storedOriginalSize > 0L) {
+                    storedOriginalSize
+                } else {
+                    getDecryptedLength(fullTierEncryptedSize)
+                }
+
+                Sgv2FileInfo(
+                    width = if (flags != 0 && width > 0) width else 0,
+                    height = if (flags != 0 && height > 0) height else 0,
+                    decryptedSize = realSize
+                )
+            }
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -231,61 +317,84 @@ object CryptoEngine {
         onProgress?.invoke(1f)
     }
 
+    private fun readFully(input: InputStream, target: ByteArray) {
+        var offset = 0
+        while (offset < target.size) {
+            val read = input.read(target, offset, target.size - offset)
+            if (read == -1) throw IOException("Unexpected EOF while reading tier blob ($offset / ${target.size})")
+            offset += read
+        }
+    }
+
     /**
      * Đọc O(1) Seek bất kỳ tier nào. Trả về luồng InputStream đã được giải mã sẵn.
      */
     fun getSgv2TierStream(context: Context, uri: Uri, tier: Tier, dek: ByteArray): InputStream? {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
-        val fis = FileInputStream(pfd.fileDescriptor)
-        val channel = fis.channel
+        // Dùng AutoCloseInputStream để khi đóng fis (hoặc BlockDecryptingInputStream ở Tier.FULL)
+        // thì pfd cũng được tự động đóng theo, tránh rò rỉ FileDescriptor.
+        val fis = ParcelFileDescriptor.AutoCloseInputStream(pfd)
+        return try {
+            val channel = fis.channel
 
-        // Đọc 96 bytes Header
-        val headerBuffer = ByteBuffer.allocate(96)
-        channel.read(headerBuffer)
-        headerBuffer.flip()
-
-        val magic = ByteArray(4)
-        headerBuffer.get(magic)
-        if (!magic.contentEquals(SGV2_MAGIC)) throw IllegalStateException("Not an SGV2 format")
-
-        val headerNonce = ByteArray(12)
-        headerBuffer.get(headerNonce)
-        val headerCipher = ByteArray(80)
-        headerBuffer.get(headerCipher)
-
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, headerNonce))
-        val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
-
-        val thumbLen = headerPlain.long
-        val screenLen = headerPlain.long
-
-        val offsetThumb = 96L
-        val offsetScreen = offsetThumb + thumbLen
-        val offsetFull = offsetScreen + screenLen
-
-        return when(tier) {
-            Tier.THUMB -> {
-                channel.position(offsetThumb)
-                val blob = ByteArray(thumbLen.toInt())
-                fis.read(blob)
+            // Đọc đủ 96 bytes Header
+            val headerBuffer = ByteBuffer.allocate(96)
+            while (headerBuffer.hasRemaining()) {
+                if (channel.read(headerBuffer) == -1) break
+            }
+            headerBuffer.flip()
+            if (headerBuffer.remaining() < 96) {
                 fis.close()
-                pfd.close()
-                ByteArrayInputStream(decryptBlob(blob, dek))
+                return null
             }
-            Tier.SCREEN -> {
-                channel.position(offsetScreen)
-                val blob = ByteArray(screenLen.toInt())
-                fis.read(blob)
+
+            val magic = ByteArray(4)
+            headerBuffer.get(magic)
+            if (!magic.contentEquals(SGV2_MAGIC)) {
                 fis.close()
-                pfd.close()
-                ByteArrayInputStream(decryptBlob(blob, dek))
+                throw IllegalStateException("Not an SGV2 format")
             }
-            Tier.FULL -> {
-                channel.position(offsetFull)
-                // KHÔNG close fis/pfd ở đây, BlockDecryptingInputStream sẽ chiếm quyền quản lý nó
-                BlockDecryptingInputStream(fis, dek)
+
+            val headerNonce = ByteArray(12)
+            headerBuffer.get(headerNonce)
+            val headerCipher = ByteArray(80)
+            headerBuffer.get(headerCipher)
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, headerNonce))
+            val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
+
+            val thumbLen = headerPlain.long
+            val screenLen = headerPlain.long
+
+            val offsetThumb = 96L
+            val offsetScreen = offsetThumb + thumbLen
+            val offsetFull = offsetScreen + screenLen
+
+            when (tier) {
+                Tier.THUMB -> {
+                    channel.position(offsetThumb)
+                    val blob = ByteArray(thumbLen.toInt())
+                    readFully(fis, blob)
+                    fis.close()
+                    ByteArrayInputStream(decryptBlob(blob, dek))
+                }
+                Tier.SCREEN -> {
+                    channel.position(offsetScreen)
+                    val blob = ByteArray(screenLen.toInt())
+                    readFully(fis, blob)
+                    fis.close()
+                    ByteArrayInputStream(decryptBlob(blob, dek))
+                }
+                Tier.FULL -> {
+                    channel.position(offsetFull)
+                    // BlockDecryptingInputStream sẽ đóng fis (và tự đóng luôn pfd nhờ AutoCloseInputStream)
+                    BlockDecryptingInputStream(fis, dek)
+                }
             }
+        } catch (e: Exception) {
+            try { fis.close() } catch (_: Exception) {}
+            throw e
         }
     }
 

@@ -488,10 +488,9 @@ fun MediaViewerScreen(
             }
         }
 
-        // TẢI TIER 2: SCREEN SIZE (Cho animation đóng/mở, đồng thời cache riêng theo item để
-        // Pager tra cứu AN TOÀN - xem ScreenBitmapCache + comment về bóng ma z-axis ở đầu file).
+        // TẢI TIER 2: SCREEN SIZE (Cho cả Ảnh VÀ Video - nạp ảnh bìa 1080p từ tầng SCREEN
+        // để hiệu ứng mở/đóng và lúc lướt qua video hiển thị sắc nét tức thì trước khi ExoPlayer phát).
         LaunchedEffect(currentItem, dek) {
-            if (currentItem.isVideo) return@LaunchedEffect
             val key = dek ?: return@LaunchedEffect
             val targetName = currentItem.encryptedName
 
@@ -563,9 +562,10 @@ fun MediaViewerScreen(
 
         var pagerScrollEnabled by remember { mutableStateOf(true) }
 
-        // LOAD FILE INFO
-        LaunchedEffect(currentItem, dek, showInteractiveViewer) {
-            if (!showInteractiveViewer) return@LaunchedEffect
+        // LOAD FILE INFO (Chỉ chạy khi người dùng thực sự bấm mở hộp thoại Info, và đọc O(1)
+        // trực tiếp từ 96-byte Header của SGV2 thay vì giải mã toàn bộ tầng FULL ra file tạm).
+        LaunchedEffect(currentItem, dek, showInfoDialog) {
+            if (!showInfoDialog) return@LaunchedEffect
             val key = dek ?: return@LaunchedEffect
             imageWidth = null
             imageHeight = null
@@ -573,39 +573,36 @@ fun MediaViewerScreen(
             loadingInfo = true
             withContext(Dispatchers.IO) {
                 try {
-                    CryptoEngine.getSgv2TierStream(context, currentItem.uri, CryptoEngine.Tier.FULL, key)?.use { decryptedStream ->
-                        if (currentItem.isVideo) {
-                            val tempFile = java.io.File(context.cacheDir, "temp_info_video")
-                            try {
-                                tempFile.outputStream().use { out -> decryptedStream.copyTo(out) }
-                                val retriever = MediaMetadataRetriever()
-                                try {
-                                    retriever.setDataSource(tempFile.absolutePath)
-                                    imageWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull()
-                                    imageHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull()
-                                } finally {
-                                    retriever.release()
+                    val info = CryptoEngine.readSgv2FileInfo(context, currentItem.uri, key)
+                    if (info != null) {
+                        decryptedSize = info.decryptedSize
+                        if (info.width > 0 && info.height > 0) {
+                            imageWidth = info.width
+                            imageHeight = info.height
+                        }
+                    }
+
+                    // Fallback nhẹ cho các file SGV2 cũ (được tạo trước khi Header lưu width/height):
+                    if (imageWidth == null || imageHeight == null) {
+                        val cachedFull = FullBitmapCache.get(currentItem.encryptedName)
+                        if (cachedFull != null) {
+                            imageWidth = cachedFull.width
+                            imageHeight = cachedFull.height
+                        } else if (!currentItem.isVideo) {
+                            CryptoEngine.getSgv2TierStream(context, currentItem.uri, CryptoEngine.Tier.FULL, key)?.use { stream ->
+                                val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                                BitmapFactory.decodeStream(stream, null, options)
+                                if (options.outWidth > 0 && options.outHeight > 0) {
+                                    imageWidth = options.outWidth
+                                    imageHeight = options.outHeight
                                 }
-                                decryptedSize = tempFile.length()
-                            } finally {
-                                if (tempFile.exists()) tempFile.delete()
                             }
                         } else {
-                            var totalDecryptedBytes = 0L
-                            val countingStream = object : java.io.FilterInputStream(decryptedStream) {
-                                override fun read(): Int { val b = super.read(); if (b != -1) totalDecryptedBytes++; return b }
-                                override fun read(b: ByteArray, off: Int, len: Int): Int {
-                                    val r = super.read(b, off, len); if (r != -1) totalDecryptedBytes += r; return r
-                                }
+                            val cachedScreen = ScreenBitmapCache.get(currentItem.encryptedName)
+                            if (cachedScreen != null) {
+                                imageWidth = cachedScreen.width
+                                imageHeight = cachedScreen.height
                             }
-                            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                            BitmapFactory.decodeStream(countingStream, null, options)
-                            val buffer = ByteArray(8192)
-                            var read = countingStream.read(buffer)
-                            while (read != -1) { read = countingStream.read(buffer) }
-                            imageWidth = options.outWidth
-                            imageHeight = options.outHeight
-                            decryptedSize = totalDecryptedBytes
                         }
                     }
                 } catch (e: Exception) {
@@ -1485,6 +1482,29 @@ fun EncryptedVideoPlayer(
 ) {
     var isVideoReady by remember { mutableStateOf(false) }
     var exoPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
+    var localScreenBitmap by remember(item.encryptedName) {
+        mutableStateOf(ScreenBitmapCache.get(item.encryptedName))
+    }
+
+    // Mồi sẵn tầng SCREEN (1080p) cho cả trang video kế bên (nhờ beyondViewportPageCount = 1)
+    // để khi vuốt tới là có ngay ảnh bìa 1080p sắc nét trước khi ExoPlayer kịp render frame đầu.
+    LaunchedEffect(item.encryptedName, dek) {
+        if (localScreenBitmap != null) return@LaunchedEffect
+        withContext(Dispatchers.IO) {
+            try {
+                CryptoEngine.getSgv2TierStream(context, item.uri, CryptoEngine.Tier.SCREEN, dek)?.use { stream ->
+                    val bytes = stream.readBytes()
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                    if (bmp != null) {
+                        ScreenBitmapCache.put(item.encryptedName, bmp)
+                        withContext(Dispatchers.Main) {
+                            localScreenBitmap = bmp
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
 
     // FIX TẠI ĐÂY: Trì hoãn việc tạo ExoPlayer cho tới khi trang này thực sự Active
     // Tránh bị lock frame UI khi đang vuốt ngang.
@@ -1638,9 +1658,10 @@ fun EncryptedVideoPlayer(
                 )
             }
 
-            if ((!isVideoReady || exoPlayer == null) && placeholderBitmap != null) {
+            val effectivePlaceholder = localScreenBitmap ?: placeholderBitmap
+            if ((!isVideoReady || exoPlayer == null) && effectivePlaceholder != null) {
                 Image(
-                    bitmap = placeholderBitmap,
+                    bitmap = effectivePlaceholder,
                     contentDescription = null,
                     modifier = Modifier
                         .fillMaxSize()

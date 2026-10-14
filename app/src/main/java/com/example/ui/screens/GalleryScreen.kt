@@ -1,49 +1,79 @@
 package com.example.ui.screens
 
 import android.app.Activity
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CreateNewFolder
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Image
-import coil.request.ImageRequest
-import coil.size.Size
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -52,6 +82,7 @@ import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.Text
@@ -62,47 +93,55 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import coil.ImageLoader
 import coil.compose.rememberAsyncImagePainter
+import coil.request.ImageRequest
+import coil.size.Size
 import com.example.coil.EncryptedUriFetcher
 import com.example.ui.VaultItem
 import com.example.ui.VaultViewModel
+import com.example.ui.VideoFramePickRequest
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
 // ------------------------------------------------------------------------------------
 // CACHE BITMAP THUMB DÙNG CHUNG GIỮA GalleryScreen VÀ MediaViewerScreen
-// TẠI SAO CẦN CÁI NÀY: GalleryGridItem load thumb qua rememberAsyncImagePainter (Coil) ->
-// kết quả chỉ là 1 Painter sống bên trong đúng Composable đó, MediaViewerScreen không có
-// cách nào "mượn" lại được. Hơn nữa GalleryScreen và MediaViewerScreen mỗi bên tự dựng 1
-// ImageLoader riêng (2 instance khác nhau -> 2 memory cache khác nhau) nên dù có gọi qua
-// Coil cũng vẫn cache-miss. Y hệt myapp (Gallery.kt): bitmap decode cho ô grid được giữ
-// trong closure và truyền thẳng sang openFullscreen(...), KHÔNG decode lại lần 2.
-// Ở đây ta làm tương đương bằng 1 cache Bitmap nhỏ, key theo encryptedName: GalleryGridItem
-// ghi vào ngay khi Coil decode xong, MediaViewerScreen đọc ra dùng ngay nếu có, chỉ decode
-// thủ công (BitmapFactory) khi cache-miss (ví dụ mở thẳng bằng deep link, chưa từng qua Grid).
 // ------------------------------------------------------------------------------------
 object ThumbBitmapCache {
     private const val MAX_ENTRIES = 80
 
-    // accessOrder = true -> LRU thật sự (mục vừa get() sẽ nhảy lên "mới nhất")
     private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
         MAX_ENTRIES, 0.75f, true
     ) {
@@ -118,6 +157,49 @@ object ThumbBitmapCache {
     fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
         cache[key] = bitmap
     }
+
+    @Synchronized
+    fun remove(key: String) {
+        cache.remove(key)
+    }
+}
+
+private fun findMediaItemIndexAtPosition(
+    gridState: LazyGridState,
+    touchPos: Offset,
+    keyToIndex: Map<String, Int>
+): Int? {
+    val visibleItems = gridState.layoutInfo.visibleItemsInfo
+    if (visibleItems.isEmpty()) return null
+
+    for (info in visibleItems) {
+        val keyStr = info.key as? String ?: continue
+        val mediaIdx = keyToIndex[keyStr] ?: continue
+        val left = info.offset.x.toFloat()
+        val top = info.offset.y.toFloat()
+        val right = left + info.size.width
+        val bottom = top + info.size.height
+        if (touchPos.x in left..right && touchPos.y in top..bottom) {
+            return mediaIdx
+        }
+    }
+
+    var closestIdx: Int? = null
+    var minDistanceSq = Float.MAX_VALUE
+    for (info in visibleItems) {
+        val keyStr = info.key as? String ?: continue
+        val mediaIdx = keyToIndex[keyStr] ?: continue
+        val centerX = info.offset.x + info.size.width / 2f
+        val centerY = info.offset.y + info.size.height / 2f
+        val dx = touchPos.x - centerX
+        val dy = touchPos.y - centerY
+        val distSq = dx * dx + dy * dy
+        if (distSq < minDistanceSq) {
+            minDistanceSq = distSq
+            closestIdx = mediaIdx
+        }
+    }
+    return closestIdx
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
@@ -127,11 +209,8 @@ fun GalleryScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current
 
-    // Back gesture locks the vault (returning to home/welcome screen)
-    BackHandler {
-        viewModel.lockVault()
-    }
     val items by viewModel.items.collectAsState()
     val vaultUri by viewModel.vaultUri.collectAsState()
     val dek by viewModel.dek.collectAsState()
@@ -139,10 +218,63 @@ fun GalleryScreen(
     val importProgress by viewModel.importProgress.collectAsState()
     val importQueueTotal by viewModel.importQueueTotal.collectAsState()
     val importQueueIndex by viewModel.importQueueIndex.collectAsState()
+    val currentImportThumb by viewModel.currentImportThumb.collectAsState()
+    val currentImportIsVideo by viewModel.currentImportIsVideo.collectAsState()
+    val isCancellingImport by viewModel.isCancellingImport.collectAsState()
+    val videoFramePickRequest by viewModel.videoFramePickRequest.collectAsState()
     val error by viewModel.error.collectAsState()
     val animatingItem by viewModel.animatingItem.collectAsState()
 
-    // Build the custom secure Coil ImageLoader using our custom decryptor fetcher
+    var isSelectionMode by remember { mutableStateOf(false) }
+    var selectedEncryptedNames by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showBulkDeleteDialog by remember { mutableStateOf(false) }
+    var isImportMenuExpanded by remember { mutableStateOf(false) }
+
+    val orderedKeys = remember(items) { items.map { it.encryptedName } }
+    val keyToIndexMap = remember(orderedKeys) {
+        orderedKeys.withIndex().associate { (idx, key) -> key to idx }
+    }
+
+    val isFullVaultSelected = remember(items, selectedEncryptedNames) {
+        items.isNotEmpty() && selectedEncryptedNames.size == items.size
+    }
+
+    val gridState = rememberLazyGridState()
+    var autoScrollSpeedPx by remember { mutableFloatStateOf(0f) }
+
+    LaunchedEffect(autoScrollSpeedPx) {
+        if (autoScrollSpeedPx != 0f) {
+            while (autoScrollSpeedPx != 0f) {
+                gridState.scrollBy(autoScrollSpeedPx)
+                delay(16L)
+            }
+        }
+    }
+
+    LaunchedEffect(items) {
+        val existingNames = items.map { it.encryptedName }.toSet()
+        selectedEncryptedNames = selectedEncryptedNames.intersect(existingNames)
+        if (items.isEmpty()) {
+            isSelectionMode = false
+        }
+    }
+
+    BackHandler {
+        when {
+            isImportMenuExpanded -> {
+                isImportMenuExpanded = false
+            }
+            isSelectionMode -> {
+                isSelectionMode = false
+                selectedEncryptedNames = emptySet()
+                autoScrollSpeedPx = 0f
+            }
+            else -> {
+                viewModel.lockVault()
+            }
+        }
+    }
+
     val customImageLoader = remember(dek) {
         dek?.let { key ->
             ImageLoader.Builder(context)
@@ -153,13 +285,9 @@ fun GalleryScreen(
         }
     }
 
-    // SAF File Picker to import media (*/* but we check image/video) - hỗ trợ chọn NHIỀU file cùng lúc
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris: List<Uri> ->
-        // Tắt animation mặc định của hệ điều hành ngay khi Document Picker đóng lại và quay về
-        // đây (máy chạy Android < 14 - máy >= 14 đã được xử lý bằng overrideActivityTransition
-        // trong MainActivity), tránh xung đột với animation Compose tự vẽ của popup tiến trình.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             @Suppress("DEPRECATION")
             (context as? Activity)?.overridePendingTransition(0, 0)
@@ -169,8 +297,21 @@ fun GalleryScreen(
         }
     }
 
+    val folderImportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri: Uri? ->
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            @Suppress("DEPRECATION")
+            (context as? Activity)?.overridePendingTransition(0, 0)
+        }
+        if (treeUri != null) {
+            viewModel.importFolderMedia(context, treeUri)
+        }
+    }
+
     val folderName = remember(vaultUri) {
-        vaultUri?.lastPathSegment?.substringAfterLast(':') ?: "Vault"
+        val raw = vaultUri?.lastPathSegment?.substringAfterLast(':') ?: "Vault"
+        raw.trim('/').substringAfterLast('/').ifEmpty { raw }
     }
 
     Scaffold(
@@ -186,32 +327,136 @@ fun GalleryScreen(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Text(
-                            text = "${items.size} secure files",
-                            fontSize = 11.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        val subtitleText = if (isSelectionMode) {
+                            "${selectedEncryptedNames.size} / ${items.size} selected"
+                        } else {
+                            "${items.size} secure files"
+                        }
+                        val subtitleColor by animateColorAsState(
+                            targetValue = if (isSelectionMode && selectedEncryptedNames.isNotEmpty()) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            animationSpec = tween(200),
+                            label = "subtitle_color"
                         )
+                        AnimatedContent(
+                            targetState = subtitleText,
+                            transitionSpec = {
+                                fadeIn(tween(150)).togetherWith(fadeOut(tween(120)))
+                            },
+                            label = "subtitle_text_anim"
+                        ) { textVal ->
+                            Text(
+                                text = textVal,
+                                fontSize = 11.sp,
+                                color = subtitleColor
+                            )
+                        }
                     }
                 },
                 actions = {
-                    IconButton(
-                        onClick = { viewModel.loadVaultItems(context) },
-                        modifier = Modifier.testTag("refresh_button")
+                    AnimatedVisibility(
+                        visible = isSelectionMode && items.isNotEmpty(),
+                        enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.85f, animationSpec = tween(180)),
+                        exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.85f, animationSpec = tween(140))
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.Refresh,
-                            contentDescription = "Refresh Grid"
-                        )
+                        TextButton(
+                            onClick = {
+                                selectedEncryptedNames = if (isFullVaultSelected) {
+                                    emptySet()
+                                } else {
+                                    orderedKeys.toSet()
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.testTag("select_full_vault_button")
+                        ) {
+                            val tintColor by animateColorAsState(
+                                targetValue = if (isFullVaultSelected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                                animationSpec = tween(180),
+                                label = "all_btn_tint"
+                            )
+                            Icon(
+                                imageVector = Icons.Filled.DoneAll,
+                                contentDescription = "Select Full Vault",
+                                tint = tintColor,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isFullVaultSelected) "NONE" else "ALL",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isFullVaultSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
                     }
+
+                    val showDeleteAction = isSelectionMode && selectedEncryptedNames.isNotEmpty()
+                    AnimatedContent(
+                        targetState = showDeleteAction,
+                        transitionSpec = {
+                            (fadeIn(tween(180)) + scaleIn(initialScale = 0.75f, animationSpec = spring(dampingRatio = 0.7f)))
+                                .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.75f, animationSpec = tween(140)))
+                        },
+                        label = "refresh_or_delete_action"
+                    ) { isDelete ->
+                        if (isDelete) {
+                            IconButton(
+                                onClick = { showBulkDeleteDialog = true },
+                                modifier = Modifier.testTag("delete_selected_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Delete,
+                                    contentDescription = "Delete Selected",
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                            }
+                        } else {
+                            IconButton(
+                                onClick = { viewModel.loadVaultItems(context) },
+                                modifier = Modifier.testTag("refresh_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Refresh,
+                                    contentDescription = "Refresh Grid"
+                                )
+                            }
+                        }
+                    }
+
                     IconButton(
-                        onClick = { viewModel.lockVault() },
-                        modifier = Modifier.testTag("lock_button")
+                        onClick = {
+                            if (isSelectionMode) {
+                                isSelectionMode = false
+                                selectedEncryptedNames = emptySet()
+                                autoScrollSpeedPx = 0f
+                            } else {
+                                isSelectionMode = true
+                            }
+                        },
+                        modifier = Modifier.testTag("choose_edit_button")
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.Lock,
-                            contentDescription = "Lock Vault",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
+                        AnimatedContent(
+                            targetState = isSelectionMode,
+                            transitionSpec = {
+                                (fadeIn(tween(180)) + scaleIn(initialScale = 0.75f, animationSpec = spring(dampingRatio = 0.7f)))
+                                    .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.75f, animationSpec = tween(140)))
+                            },
+                            label = "choose_edit_icon_anim"
+                        ) { selecting ->
+                            Icon(
+                                imageVector = if (selecting) Icons.Filled.Close else Icons.Filled.Edit,
+                                contentDescription = if (selecting) "Cancel Selection" else "Choose Items",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
                     }
                 },
                 windowInsets = WindowInsets(0, 0, 0, 0),
@@ -222,16 +467,125 @@ fun GalleryScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = { importLauncher.launch(arrayOf("image/*", "video/*")) },
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.testTag("import_fab")
+            AnimatedVisibility(
+                visible = !isSelectionMode,
+                enter = scaleIn(animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium)) + fadeIn(tween(180)),
+                exit = scaleOut(animationSpec = tween(150)) + fadeOut(tween(150))
             ) {
-                Icon(
-                    imageVector = Icons.Filled.AddPhotoAlternate,
-                    contentDescription = "Import Media"
-                )
+                Column(
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    AnimatedVisibility(
+                        visible = isImportMenuExpanded,
+                        enter = fadeIn(tween(180)) +
+                                slideInVertically(
+                                    initialOffsetY = { it / 2 },
+                                    animationSpec = spring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessMedium)
+                                ) +
+                                scaleIn(initialScale = 0.85f, animationSpec = tween(180)),
+                        exit = fadeOut(tween(130)) +
+                                slideOutVertically(targetOffsetY = { it / 2 }, animationSpec = tween(130)) +
+                                scaleOut(targetScale = 0.85f, animationSpec = tween(130))
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.End,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Card(
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+                                modifier = Modifier
+                                    .border(
+                                        width = 1.dp,
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                        shape = RoundedCornerShape(14.dp)
+                                    )
+                                    .clickable {
+                                        isImportMenuExpanded = false
+                                        folderImportLauncher.launch(null)
+                                    }
+                                    .testTag("import_folder_button")
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                                ) {
+                                    Text(
+                                        text = "Import Folder",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Icon(
+                                        imageVector = Icons.Filled.CreateNewFolder,
+                                        contentDescription = "Import Folder",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+
+                            Card(
+                                shape = RoundedCornerShape(14.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+                                modifier = Modifier
+                                    .border(
+                                        width = 1.dp,
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                        shape = RoundedCornerShape(14.dp)
+                                    )
+                                    .clickable {
+                                        isImportMenuExpanded = false
+                                        importLauncher.launch(arrayOf("image/*", "video/*"))
+                                    }
+                                    .testTag("import_files_button")
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                                ) {
+                                    Text(
+                                        text = "Select Files",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Icon(
+                                        imageVector = Icons.Filled.AddPhotoAlternate,
+                                        contentDescription = "Select Files",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    val fabRotation by animateFloatAsState(
+                        targetValue = if (isImportMenuExpanded) 45f else 0f,
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
+                        label = "fab_icon_rotation"
+                    )
+                    FloatingActionButton(
+                        onClick = { isImportMenuExpanded = !isImportMenuExpanded },
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.testTag("import_fab")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = "Import Media Menu",
+                            modifier = Modifier.graphicsLayer {
+                                rotationZ = fabRotation
+                            }
+                        )
+                    }
+                }
             }
         },
         modifier = modifier
@@ -242,136 +596,403 @@ fun GalleryScreen(
                 .padding(innerPadding)
                 .background(MaterialTheme.colorScheme.background)
         ) {
-            if (items.isEmpty() && !isLoading) {
-                // Empty State Screen
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.PhotoLibrary,
-                        contentDescription = "Empty Vault",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                        modifier = Modifier.size(72.dp)
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    Text(
-                        text = "Your Secure Vault is Empty",
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = "Tap the '+' button below to import photos or videos from your device. All files will be encrypted block-by-block with zero local tracking database.",
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.widthIn(max = 300.dp)
-                    )
-                }
-            } else {
-                val groupedItems = remember(items) {
-                    val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-                    items.groupBy { item ->
-                        if (item.dateTaken == 0L) "Unknown" else sdf.format(java.util.Date(item.dateTaken))
+            AnimatedContent(
+                targetState = items.isEmpty() && !isLoading,
+                transitionSpec = {
+                    fadeIn(tween(240)).togetherWith(fadeOut(tween(180)))
+                },
+                label = "gallery_empty_or_grid"
+            ) { isEmptyState ->
+                if (isEmptyState) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.PhotoLibrary,
+                            contentDescription = "Empty Vault",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                            modifier = Modifier.size(72.dp)
+                        )
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "Your Secure Vault is Empty",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "Tap the '+' button below to import photos or videos from your device. All files will be encrypted block-by-block with zero local tracking database.",
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.widthIn(max = 300.dp)
+                        )
                     }
-                }
+                } else {
+                    val groupedItems = remember(items) {
+                        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+                        items.groupBy { item ->
+                            if (item.dateTaken == 0L) "Unknown" else sdf.format(java.util.Date(item.dateTaken))
+                        }
+                    }
 
-                // Grid Screen (5 columns as requested)
-                LazyVerticalGrid(
-                    columns = GridCells.Fixed(5),
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .testTag("gallery_grid"),
-                    contentPadding = PaddingValues(vertical = 1.dp), // Bỏ padding ngang, giữ padding dọc
-                    horizontalArrangement = Arrangement.spacedBy(1.dp), // Giảm khoảng cách còn 1 nửa
-                    verticalArrangement = Arrangement.spacedBy(1.dp)  // Giảm khoảng cách còn 1 nửa
-                ) {
-                    groupedItems.forEach { (dateKey, itemsInGroup) ->
-                        // Add Date Section Header spanning all 5 columns
-                        item(
-                            key = "header_$dateKey",
-                            span = { GridItemSpan(maxLineSpan) }
-                        ) {
-                            val displayHeader = remember(dateKey, itemsInGroup) {
-                                val firstItem = itemsInGroup.firstOrNull()
-                                if (firstItem != null && firstItem.dateTaken != 0L) {
-                                    formatGroupDate(firstItem.dateTaken)
-                                } else {
-                                    "Unknown Date"
+                    val currentOrderedKeys by rememberUpdatedState(orderedKeys)
+                    val currentKeyToIndex by rememberUpdatedState(keyToIndexMap)
+                    val currentSelectedSet by rememberUpdatedState(selectedEncryptedNames)
+
+                    val edgeScrollThresholdPx = with(density) { 64.dp.toPx() }
+                    val maxAutoScrollStepPx = with(density) { 18.dp.toPx() }
+                    val touchSlopPx = with(density) { 10.dp.toPx() }
+
+                    val dragSelectModifier = Modifier.pointerInput(isSelectionMode) {
+                        if (!isSelectionMode) return@pointerInput
+
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val startPos = down.position
+
+                            var startIndex: Int? = null
+                            var startedOnCheckboxCorner = false
+                            for (info in gridState.layoutInfo.visibleItemsInfo) {
+                                val keyStr = info.key as? String ?: continue
+                                val idx = currentKeyToIndex[keyStr] ?: continue
+                                val left = info.offset.x.toFloat()
+                                val top = info.offset.y.toFloat()
+                                val right = left + info.size.width
+                                val bottom = top + info.size.height
+                                if (startPos.x in left..right && startPos.y in top..bottom) {
+                                    startIndex = idx
+                                    if (startPos.x >= left + info.size.width * 0.5f &&
+                                        startPos.y >= top + info.size.height * 0.5f
+                                    ) {
+                                        startedOnCheckboxCorner = true
+                                    }
+                                    break
                                 }
                             }
 
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(start = 8.dp, top = 16.dp, end = 8.dp, bottom = 4.dp)
+                            if (startIndex == null) return@awaitEachGesture
+
+                            var isDragSelecting = false
+                            var baselineSelection: Set<String> = emptySet()
+                            var targetSelectState = true
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!change.pressed) break
+
+                                val pos = change.position
+                                val totalDx = pos.x - startPos.x
+                                val totalDy = pos.y - startPos.y
+
+                                if (!isDragSelecting) {
+                                    val movedEnough = (pos - startPos).getDistance() > touchSlopPx
+                                    if (movedEnough && (startedOnCheckboxCorner || abs(totalDx) > abs(totalDy) * 1.15f)) {
+                                        isDragSelecting = true
+                                        baselineSelection = currentSelectedSet
+                                        val startKey = currentOrderedKeys.getOrNull(startIndex)
+                                        targetSelectState = startKey == null || (startKey !in baselineSelection)
+                                    } else if (movedEnough && abs(totalDy) > abs(totalDx) * 1.5f) {
+                                        break
+                                    }
+                                }
+
+                                if (isDragSelecting) {
+                                    change.consume()
+
+                                    val viewportH = size.height.toFloat()
+                                    autoScrollSpeedPx = when {
+                                        pos.y < edgeScrollThresholdPx -> {
+                                            val ratio = ((edgeScrollThresholdPx - pos.y) / edgeScrollThresholdPx).coerceIn(0f, 1f)
+                                            -maxAutoScrollStepPx * ratio
+                                        }
+                                        pos.y > viewportH - edgeScrollThresholdPx -> {
+                                            val ratio = ((pos.y - (viewportH - edgeScrollThresholdPx)) / edgeScrollThresholdPx).coerceIn(0f, 1f)
+                                            maxAutoScrollStepPx * ratio
+                                        }
+                                        else -> 0f
+                                    }
+
+                                    val hoveredIdx = findMediaItemIndexAtPosition(
+                                        gridState = gridState,
+                                        touchPos = pos,
+                                        keyToIndex = currentKeyToIndex
+                                    )
+
+                                    if (hoveredIdx != null) {
+                                        val minIdx = minOf(startIndex, hoveredIdx)
+                                        val maxIdx = maxOf(startIndex, hoveredIdx)
+                                        val keysInRange = currentOrderedKeys.subList(
+                                            minIdx.coerceAtLeast(0),
+                                            (maxIdx + 1).coerceAtMost(currentOrderedKeys.size)
+                                        ).toSet()
+
+                                        selectedEncryptedNames = if (targetSelectState) {
+                                            baselineSelection + keysInRange
+                                        } else {
+                                            baselineSelection - keysInRange
+                                        }
+                                    }
+                                }
+                            }
+
+                            autoScrollSpeedPx = 0f
+                        }
+                    }
+
+                    LazyVerticalGrid(
+                        state = gridState,
+                        columns = GridCells.Fixed(5),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .then(dragSelectModifier)
+                            .testTag("gallery_grid"),
+                        contentPadding = PaddingValues(vertical = 1.dp),
+                        horizontalArrangement = Arrangement.spacedBy(1.dp),
+                        verticalArrangement = Arrangement.spacedBy(1.dp)
+                    ) {
+                        groupedItems.forEach { (dateKey, itemsInGroup) ->
+                            item(
+                                key = "header_$dateKey",
+                                span = { GridItemSpan(maxLineSpan) }
                             ) {
-                                Text(
-                                    text = displayHeader,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.testTag("section_header_$dateKey")
+                                val displayHeader = remember(dateKey, itemsInGroup) {
+                                    val firstItem = itemsInGroup.firstOrNull()
+                                    if (firstItem != null && firstItem.dateTaken != 0L) {
+                                        formatGroupDate(firstItem.dateTaken)
+                                    } else {
+                                        "Unknown Date"
+                                    }
+                                }
+
+                                val groupKeys = remember(itemsInGroup) {
+                                    itemsInGroup.map { it.encryptedName }.toSet()
+                                }
+                                val isDayAllSelected = remember(groupKeys, selectedEncryptedNames) {
+                                    groupKeys.isNotEmpty() && selectedEncryptedNames.containsAll(groupKeys)
+                                }
+
+                                // FIX LAYOUT SHIFT KHI BẬT/TẮT CHẾ ĐỘ SELECT:
+                                // Cố định chiều cao của dòng Header (height = 24.dp bên trong vùng padding cố định)
+                                // để khi nút "Select day" (cao 20.dp) hiện ra hoặc ẩn đi thì tổng chiều cao dòng
+                                // vẫn giữ nguyên tuyệt đối, không đẩy lưới ảnh dịch xuống.
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .animateItem()
+                                        .clickable(enabled = isSelectionMode) {
+                                            selectedEncryptedNames = if (isDayAllSelected) {
+                                                selectedEncryptedNames - groupKeys
+                                            } else {
+                                                selectedEncryptedNames + groupKeys
+                                            }
+                                        }
+                                        .padding(start = 8.dp, top = 14.dp, end = 8.dp, bottom = 6.dp)
+                                        .height(24.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text(
+                                        text = displayHeader,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.testTag("section_header_$dateKey")
+                                    )
+
+                                    AnimatedVisibility(
+                                        visible = isSelectionMode,
+                                        enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.8f, animationSpec = tween(180)),
+                                        exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.8f, animationSpec = tween(140))
+                                    ) {
+                                        val dayBgColor by animateColorAsState(
+                                            targetValue = if (isDayAllSelected) MaterialTheme.colorScheme.primary else Color.Transparent,
+                                            animationSpec = tween(160),
+                                            label = "day_check_bg"
+                                        )
+                                        val dayBorderColor by animateColorAsState(
+                                            targetValue = if (isDayAllSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            animationSpec = tween(160),
+                                            label = "day_check_border"
+                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier
+                                                .fillMaxHeight()
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .clickable {
+                                                    selectedEncryptedNames = if (isDayAllSelected) {
+                                                        selectedEncryptedNames - groupKeys
+                                                    } else {
+                                                        selectedEncryptedNames + groupKeys
+                                                    }
+                                                }
+                                                .padding(horizontal = 4.dp)
+                                                .testTag("select_day_$dateKey")
+                                        ) {
+                                            Text(
+                                                text = if (isDayAllSelected) "Selected" else "Select day",
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Medium,
+                                                color = dayBorderColor
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(20.dp)
+                                                    .clip(RoundedCornerShape(5.dp))
+                                                    .background(dayBgColor)
+                                                    .border(
+                                                        width = 1.5.dp,
+                                                        color = dayBorderColor,
+                                                        shape = RoundedCornerShape(5.dp)
+                                                    ),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                androidx.compose.animation.AnimatedVisibility(
+                                                    visible = isDayAllSelected,
+                                                    enter = scaleIn(spring(dampingRatio = 0.65f)) + fadeIn(tween(120)),
+                                                    exit = scaleOut(tween(100)) + fadeOut(tween(100))
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Check,
+                                                        contentDescription = "Day Selected",
+                                                        tint = MaterialTheme.colorScheme.onPrimary,
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            items(itemsInGroup, key = { it.encryptedName }) { item ->
+                                val isItemSelected = item.encryptedName in selectedEncryptedNames
+                                GalleryGridItem(
+                                    item = item,
+                                    imageLoader = customImageLoader,
+                                    isAnimating = animatingItem == item.encryptedName,
+                                    isSelectionMode = isSelectionMode,
+                                    isSelected = isItemSelected,
+                                    onItemClick = { bounds ->
+                                        if (isSelectionMode) {
+                                            selectedEncryptedNames = if (isItemSelected) {
+                                                selectedEncryptedNames - item.encryptedName
+                                            } else {
+                                                selectedEncryptedNames + item.encryptedName
+                                            }
+                                        } else {
+                                            viewModel.selectMedia(item, bounds)
+                                        }
+                                    },
+                                    onPositioned = { bounds -> viewModel.updateThumbnailBounds(item.encryptedName, bounds) },
+                                    modifier = Modifier.animateItem()
                                 )
                             }
-                        }
-
-                        // Add the grid items for this date group
-                        items(itemsInGroup, key = { it.encryptedName }) { item ->
-                            GalleryGridItem(
-                                item = item,
-                                imageLoader = customImageLoader,
-                                isAnimating = animatingItem == item.encryptedName,
-                                onItemClick = { bounds -> viewModel.selectMedia(item, bounds) },
-                                onPositioned = { bounds -> viewModel.updateThumbnailBounds(item.encryptedName, bounds) }
-                            )
                         }
                     }
                 }
             }
 
-            // Error Toast or banner overlay
-            error?.let { err ->
-                Snackbar(
+            if (showBulkDeleteDialog) {
+                val selectedItemsList = remember(items, selectedEncryptedNames) {
+                    items.filter { it.encryptedName in selectedEncryptedNames }
+                }
+                AlertDialog(
+                    onDismissRequest = { showBulkDeleteDialog = false },
+                    title = {
+                        Text(
+                            text = "Delete ${selectedItemsList.size} Selected Media?",
+                            fontWeight = FontWeight.Bold
+                        )
+                    },
+                    text = {
+                        Text(
+                            text = "This will permanently erase ${selectedItemsList.size} encrypted file(s) from your vault. This action cannot be undone."
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showBulkDeleteDialog = false
+                                val toDelete = selectedItemsList
+                                toDelete.forEach { ThumbBitmapCache.remove(it.encryptedName) }
+                                viewModel.deleteMultipleMedia(context, toDelete) {
+                                    selectedEncryptedNames = emptySet()
+                                    isSelectionMode = false
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                            modifier = Modifier.testTag("confirm_bulk_delete_button")
+                        ) {
+                            Text("DELETE", fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showBulkDeleteDialog = false }) {
+                            Text("CANCEL")
+                        }
+                    }
+                )
+            }
+
+            AnimatedVisibility(
+                visible = isImportMenuExpanded,
+                enter = fadeIn(tween(150)),
+                exit = fadeOut(tween(120))
+            ) {
+                Box(
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(16.dp),
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.32f))
+                        .clickable(
+                            interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            isImportMenuExpanded = false
+                        }
+                )
+            }
+
+            AnimatedVisibility(
+                visible = error != null,
+                enter = slideInVertically(initialOffsetY = { it }) + fadeIn(tween(200)),
+                exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(tween(160)),
+                modifier = Modifier.align(Alignment.BottomCenter)
+            ) {
+                Snackbar(
+                    modifier = Modifier.padding(16.dp),
                     action = {
                         TextButton(onClick = { viewModel.clearError() }) {
                             Text("DISMISS", color = MaterialTheme.colorScheme.primary)
                         }
                     }
                 ) {
-                    Text(text = err)
+                    Text(text = error ?: "")
                 }
             }
 
-            // Loading overlay - dùng AnimatedVisibility (chỉ fade) cho lớp nền đen toàn màn hình,
-            // và graphicsLayer scale RIÊNG cho mỗi cái Card nhỏ bên trong.
-            //
-            // FIX BUG "nền đen phóng to lên" (trước đây tưởng là animation window của hệ điều
-            // hành can thiệp, nhưng thực chất KHÔNG PHẢI): scaleIn/scaleOut cũ được đặt trên
-            // AnimatedVisibility bọc NGOÀI CÙNG - tức là bọc luôn cả Box nền đen fillMaxSize().
-            // Nghĩa là mỗi khi overlay xuất hiện/biến mất, TOÀN BỘ lớp phủ đen full màn hình cũng
-            // bị scale từ 92% -> 100% theo, tạo đúng cảm giác "cả màn hình đen phóng to lên" mà
-            // không hề có animation OS nào chen vào cả - đó là animation tự viết nhưng đặt sai chỗ.
-            // Giờ tách riêng: lớp đen ngoài cùng CHỈ fade (không scale bao giờ), còn hiệu ứng
-            // "pop" (scale nhẹ 92% -> 100%) chỉ áp dụng cho đúng cái Card nhỏ ở giữa.
+            // Loading / Encryption Progress Overlay với Preview Thumbnail 216x216 px nằm gọn trong vòng tròn tiến trình
             AnimatedVisibility(
-                visible = isLoading,
+                visible = isLoading && videoFramePickRequest == null,
                 enter = fadeIn(animationSpec = tween(200)),
                 exit = fadeOut(animationSpec = tween(150))
             ) {
+                val realThumbSizeDp = with(density) { VaultViewModel.THUMB_SIZE_PX.toDp() }
+                val progressRingSizeDp = realThumbSizeDp * 1.52f
+
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color.Black.copy(alpha = 0.5f)),
+                        .background(Color.Black.copy(alpha = 0.58f)),
                     contentAlignment = Alignment.Center
                 ) {
                     val cardScale by animateFloatAsState(
@@ -380,72 +1001,665 @@ fun GalleryScreen(
                         label = "import_progress_card_scale"
                     )
                     Card(
-                        modifier = Modifier.graphicsLayer {
-                            scaleX = cardScale
-                            scaleY = cardScale
-                        },
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier
+                            .padding(horizontal = 24.dp)
+                            .graphicsLayer {
+                                scaleX = cardScale
+                                scaleY = cardScale
+                            },
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
                     ) {
                         Column(
                             modifier = Modifier
                                 .padding(24.dp)
-                                .widthIn(min = 200.dp),
+                                .widthIn(min = 240.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Box(
-                                modifier = Modifier.size(64.dp),
+                                modifier = Modifier.size(progressRingSizeDp),
                                 contentAlignment = Alignment.Center
                             ) {
-                                if (importProgress > 0f) {
-                                    // Đã biết kích thước file -> vòng tròn tiến độ xác định (determinate) kèm %
+                                if (importProgress > 0f && !isCancellingImport) {
                                     CircularProgressIndicator(
                                         progress = { importProgress },
-                                        modifier = Modifier.size(64.dp),
+                                        modifier = Modifier.fillMaxSize(),
                                         color = MaterialTheme.colorScheme.primary,
                                         trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                                        strokeWidth = 4.dp
+                                        strokeWidth = 4.5.dp
                                     )
+                                } else {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.fillMaxSize(),
+                                        color = if (isCancellingImport) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                        strokeWidth = 4.5.dp
+                                    )
+                                }
+
+                                // Hình vuông Preview Thumbnail kích thước thật (216 x 216 px) nằm bên trong vòng tròn
+                                val thumbBmp = currentImportThumb
+                                if (thumbBmp != null) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(realThumbSizeDp)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .background(Color.Black)
+                                            .border(
+                                                width = 1.dp,
+                                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                                shape = RoundedCornerShape(6.dp)
+                                            ),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Image(
+                                            bitmap = thumbBmp.asImageBitmap(),
+                                            contentDescription = "Encrypting Thumbnail Preview",
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+
+                                        // Giữ icon video ở góc dưới bên phải của preview thumb khi đang mã hoá video
+                                        if (currentImportIsVideo) {
+                                            Box(
+                                                modifier = Modifier
+                                                    .align(Alignment.BottomEnd)
+                                                    .padding(4.dp)
+                                                    .clip(RoundedCornerShape(4.dp))
+                                                    .background(Color.Black.copy(alpha = 0.65f))
+                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.PlayArrow,
+                                                    contentDescription = "Video file",
+                                                    tint = Color.White,
+                                                    modifier = Modifier.size(10.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                } else if (importProgress > 0f) {
                                     Text(
                                         text = "${(importProgress * 100).toInt()}%",
-                                        fontSize = 13.sp,
+                                        fontSize = 14.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = MaterialTheme.colorScheme.primary
                                     )
-                                } else {
-                                    // Đang chuẩn bị (đọc metadata, tạo thumbnail...) -> vòng tròn indeterminate
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(64.dp),
-                                        color = MaterialTheme.colorScheme.primary,
-                                        strokeWidth = 4.dp
-                                    )
                                 }
                             }
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(
-                                text = if (importProgress > 0f) "Encrypting media blocks..." else "Preparing file...",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = TextAlign.Center
-                            )
-                            // Chỉ hiện số thứ tự file khi đang import nhiều hơn 1 file
-                            if (importQueueTotal > 1) {
-                                Spacer(modifier = Modifier.height(4.dp))
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            if (importProgress > 0f && !isCancellingImport) {
                                 Text(
-                                    text = "File $importQueueIndex / $importQueueTotal",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Medium,
+                                    text = "${(importProgress * 100).toInt()}%",
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.primary
                                 )
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
+
+                            Text(
+                                text = when {
+                                    isCancellingImport -> "Cancelling & deleting imported files..."
+                                    importProgress > 0f -> "Encrypting media blocks..."
+                                    else -> "Preparing file..."
+                                },
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (isCancellingImport) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center
+                            )
+
+                            if (importQueueTotal > 0) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "File ${importQueueIndex.coerceAtLeast(1)} / $importQueueTotal",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
+                            // Nút CANCEL IMPORT trong lúc đang mã hoá / chuẩn bị import
+                            if (importQueueTotal > 0) {
+                                Spacer(modifier = Modifier.height(16.dp))
+                                OutlinedButton(
+                                    onClick = { viewModel.cancelImport() },
+                                    enabled = !isCancellingImport,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.7f)),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        contentColor = MaterialTheme.colorScheme.error
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(40.dp)
+                                        .testTag("cancel_import_progress_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Cancel Import",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isCancellingImport) "CANCELLING..." else "CANCEL IMPORT",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 0.8.sp
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Debug log dialog removed
+            // UI CHỌN KHUNG HÌNH (FRAME) TUỲ THÍCH ĐỂ LÀM THUMBNAIL CHO VIDEO NGAY BƯỚC ĐẦU
+            videoFramePickRequest?.let { request ->
+                VideoFramePickerDialog(
+                    request = request,
+                    onConfirm = { chosenBitmap ->
+                        viewModel.confirmVideoFrameSelection(chosenBitmap)
+                    },
+                    onCancelImport = {
+                        viewModel.cancelImport()
+                    }
+                )
+            }
         }
     }
+}
+
+@Composable
+fun VideoFramePickerDialog(
+    request: VideoFramePickRequest,
+    onConfirm: (Bitmap?) -> Unit,
+    onCancelImport: () -> Unit
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    // Kích thước thật của 1 ô thumbnail trên lưới: hình vuông 216 x 216 px
+    val realThumbSizeDp = with(density) { VaultViewModel.THUMB_SIZE_PX.toDp() }
+
+    var durationMs by remember(request.uri, request.queueIndex) { mutableLongStateOf(0L) }
+    var selectedPositionMs by remember(request.uri, request.queueIndex) { mutableFloatStateOf(0f) }
+    var isDraggingSlider by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
+    var currentPreviewBitmap by remember(request.uri, request.queueIndex) { mutableStateOf<Bitmap?>(null) }
+    var filmstripBitmaps by remember(request.uri, request.queueIndex) { mutableStateOf<List<Bitmap>>(emptyList()) }
+    var isExtractingExactFrame by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
+    val goldColor = MaterialTheme.colorScheme.primary
+
+    LaunchedEffect(request.uri, request.queueIndex) {
+        withContext(Dispatchers.IO) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, request.uri)
+                val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                val firstFrame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                withContext(Dispatchers.Main) {
+                    durationMs = dur.coerceAtLeast(1L)
+                    currentPreviewBitmap = firstFrame
+                }
+
+                if (dur > 0L) {
+                    val stripCount = 8
+                    val strip = mutableListOf<Bitmap>()
+                    for (i in 0 until stripCount) {
+                        val timeUs = ((dur * i) / stripCount) * 1000L
+                        val rawFrame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                            retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, 160, 160)
+                        } else {
+                            retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)?.let { bmp ->
+                                val scaled = Bitmap.createScaledBitmap(bmp, 120, 120, true)
+                                if (scaled != bmp) bmp.recycle()
+                                scaled
+                            }
+                        }
+                        if (rawFrame != null) strip.add(rawFrame)
+                    }
+                    withContext(Dispatchers.Main) {
+                        filmstripBitmaps = strip
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            } finally {
+                try { retriever.release() } catch (_: Exception) {}
+            }
+        }
+    }
+
+    LaunchedEffect(selectedPositionMs, isDraggingSlider, request.uri, request.queueIndex) {
+        if (durationMs <= 0L) return@LaunchedEffect
+        val targetUs = (selectedPositionMs.toLong().coerceIn(0L, durationMs)) * 1000L
+
+        if (isDraggingSlider) {
+            withContext(Dispatchers.IO) {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(context, request.uri)
+                    val syncBmp = retriever.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    if (syncBmp != null) {
+                        withContext(Dispatchers.Main) {
+                            currentPreviewBitmap = syncBmp
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { retriever.release() } catch (_: Exception) {}
+                }
+            }
+        } else {
+            delay(100L)
+            isExtractingExactFrame = true
+            withContext(Dispatchers.IO) {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(context, request.uri)
+                    val exactBmp = retriever.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                        ?: retriever.getFrameAtTime(targetUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    if (exactBmp != null) {
+                        withContext(Dispatchers.Main) {
+                            currentPreviewBitmap = exactBmp
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    try { retriever.release() } catch (_: Exception) {}
+                    withContext(Dispatchers.Main) {
+                        isExtractingExactFrame = false
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog(
+        onDismissRequest = { /* Dùng nút USE THIS FRAME hoặc CANCEL */ },
+        properties = DialogProperties(
+            dismissOnBackPress = false,
+            dismissOnClickOutside = false,
+            usePlatformDefaultWidth = false
+        )
+    ) {
+        Card(
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            modifier = Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f)
+                .padding(horizontal = 14.dp)
+                .widthIn(max = 500.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Select Video Thumbnail",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = request.fileName,
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    // Chip tiến độ số video đã chọn thumb với cỡ chữ nhỏ gọn
+                    Text(
+                        text = "${request.queueIndex} / ${request.queueTotal}",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                            .padding(horizontal = 7.dp, vertical = 3.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Khung video mở rộng tối đa chiều cao (weight 1f) và hoàn toàn cố định nhờ thanh filmstrip bên dưới luôn giữ nguyên chiều cao
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    val bmp = currentPreviewBitmap
+                    if (bmp != null) {
+                        Image(
+                            bitmap = bmp.asImageBitmap(),
+                            contentDescription = "Selected Video Frame",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        Canvas(modifier = Modifier.fillMaxSize()) {
+                            val boxW = size.width
+                            val boxH = size.height
+                            val bmpW = bmp.width.toFloat().coerceAtLeast(1f)
+                            val bmpH = bmp.height.toFloat().coerceAtLeast(1f)
+
+                            val fitScale = minOf(boxW / bmpW, boxH / bmpH)
+                            val drawnW = bmpW * fitScale
+                            val drawnH = bmpH * fitScale
+                            val drawnLeft = (boxW - drawnW) / 2f
+                            val drawnTop = (boxH - drawnH) / 2f
+
+                            val squareSize = minOf(drawnW, drawnH)
+                            val sqLeft = (boxW - squareSize) / 2f
+                            val sqTop = (boxH - squareSize) / 2f
+                            val sqRight = sqLeft + squareSize
+                            val sqBottom = sqTop + squareSize
+
+                            val dimColor = Color.Black.copy(alpha = 0.48f)
+
+                            if (drawnW > squareSize) {
+                                drawRect(
+                                    color = dimColor,
+                                    topLeft = Offset(drawnLeft, drawnTop),
+                                    size = ComposeSize(sqLeft - drawnLeft, drawnH)
+                                )
+                                drawRect(
+                                    color = dimColor,
+                                    topLeft = Offset(sqRight, drawnTop),
+                                    size = ComposeSize((drawnLeft + drawnW) - sqRight, drawnH)
+                                )
+                            } else if (drawnH > squareSize) {
+                                drawRect(
+                                    color = dimColor,
+                                    topLeft = Offset(drawnLeft, drawnTop),
+                                    size = ComposeSize(drawnW, sqTop - drawnTop)
+                                )
+                                drawRect(
+                                    color = dimColor,
+                                    topLeft = Offset(drawnLeft, sqBottom),
+                                    size = ComposeSize(drawnW, (drawnTop + drawnH) - sqBottom)
+                                )
+                            }
+
+                            drawRect(
+                                color = Color.White.copy(alpha = 0.9f),
+                                topLeft = Offset(sqLeft, sqTop),
+                                size = ComposeSize(squareSize, squareSize),
+                                style = Stroke(width = 2.dp.toPx())
+                            )
+
+                            val cornerLen = minOf(20.dp.toPx(), squareSize * 0.22f)
+                            val cornerStroke = 3.5.dp.toPx()
+                            drawLine(goldColor, Offset(sqLeft, sqTop), Offset(sqLeft + cornerLen, sqTop), cornerStroke)
+                            drawLine(goldColor, Offset(sqLeft, sqTop), Offset(sqLeft, sqTop + cornerLen), cornerStroke)
+                            drawLine(goldColor, Offset(sqRight - cornerLen, sqTop), Offset(sqRight, sqTop), cornerStroke)
+                            drawLine(goldColor, Offset(sqRight, sqTop), Offset(sqRight, sqTop + cornerLen), cornerStroke)
+                            drawLine(goldColor, Offset(sqLeft, sqBottom - cornerLen), Offset(sqLeft, sqBottom), cornerStroke)
+                            drawLine(goldColor, Offset(sqLeft, sqBottom), Offset(sqLeft + cornerLen, sqBottom), cornerStroke)
+                            drawLine(goldColor, Offset(sqRight - cornerLen, sqBottom), Offset(sqRight, sqBottom), cornerStroke)
+                            drawLine(goldColor, Offset(sqRight, sqBottom - cornerLen), Offset(sqRight, sqBottom), cornerStroke)
+                        }
+                    } else {
+                        CircularProgressIndicator(
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(36.dp)
+                        )
+                    }
+
+                    // PREVIEW THUMBNAIL KÍCH THƯỚC THẬT (Hình vuông 216 x 216 px) Ở GÓC TRÊN BÊN PHẢI
+                    // (Đã bỏ icon video góc dưới phải và bỏ chữ 216x216 px)
+                    if (bmp != null) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(8.dp)
+                                .size(realThumbSizeDp)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(Color.Black)
+                                .border(
+                                    width = 1.5.dp,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    shape = RoundedCornerShape(6.dp)
+                                )
+                        ) {
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = "Actual 1:1 Thumbnail Preview",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(8.dp)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color.Black.copy(alpha = 0.65f))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = "${formatMillisPrecise(selectedPositionMs.toLong())} / ${formatMillisPrecise(durationMs)}",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // THANH TUA THỜI GIAN GỘP CHUNG VỚI BAR THUMB HORIZONTAL (FILMSTRIP SCRUBBER):
+                // Luôn giữ chiều cao cố định 48.dp ngay từ đầu (kể cả khi filmstripBitmaps đang tải)
+                // để khung video phía trên không bao giờ bị giật/thay đổi chiều cao.
+                val currentDurationMs by rememberUpdatedState(durationMs)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                        .border(1.dp, MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(8.dp))
+                        .pointerInput(request.uri, request.queueIndex) {
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val barWidth = size.width.toFloat().coerceAtLeast(1f)
+                                val dur = currentDurationMs.toFloat().coerceAtLeast(1f)
+
+                                isDraggingSlider = true
+                                selectedPositionMs = ((down.position.x / barWidth).coerceIn(0f, 1f)) * dur
+                                down.consume()
+
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                    if (!change.pressed) break
+                                    selectedPositionMs = ((change.position.x / barWidth).coerceIn(0f, 1f)) * dur
+                                    change.consume()
+                                }
+                                isDraggingSlider = false
+                            }
+                        }
+                        .testTag("video_thumb_slider")
+                ) {
+                    if (filmstripBitmaps.isNotEmpty()) {
+                        Row(modifier = Modifier.fillMaxSize()) {
+                            filmstripBitmaps.forEach { stripBmp ->
+                                Image(
+                                    bitmap = stripBmp.asImageBitmap(),
+                                    contentDescription = null,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .fillMaxHeight()
+                                )
+                            }
+                        }
+                    }
+
+                    // Vạch chỉ thời gian (Playhead) trượt mượt trực tiếp trên dải thumbnail ngang
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val dur = durationMs.toFloat().coerceAtLeast(1f)
+                        val fraction = (selectedPositionMs / dur).coerceIn(0f, 1f)
+                        val playheadX = (fraction * size.width).coerceIn(3.dp.toPx(), size.width - 3.dp.toPx())
+
+                        // Lớp phủ tối nhẹ cho phần thời gian đã đi qua
+                        drawRect(
+                            color = Color.Black.copy(alpha = 0.22f),
+                            topLeft = Offset.Zero,
+                            size = ComposeSize(playheadX, size.height)
+                        )
+
+                        // Đổ bóng đen nhẹ sau thanh kéo để nổi bật trên mọi nền video
+                        drawRoundRect(
+                            color = Color.Black.copy(alpha = 0.65f),
+                            topLeft = Offset(playheadX - 3.5.dp.toPx(), 0f),
+                            size = ComposeSize(7.dp.toPx(), size.height),
+                            cornerRadius = CornerRadius(3.5.dp.toPx(), 3.5.dp.toPx())
+                        )
+
+                        // Thanh kim chỉ vị trí (Playhead) màu vàng kim chủ đạo
+                        drawRoundRect(
+                            color = goldColor,
+                            topLeft = Offset(playheadX - 2.dp.toPx(), 1.5.dp.toPx()),
+                            size = ComposeSize(4.dp.toPx(), size.height - 3.dp.toPx()),
+                            cornerRadius = CornerRadius(2.dp.toPx(), 2.dp.toPx())
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
+                ) {
+                    listOf(-1000L to "-1s", -100L to "-0.1s", 100L to "+0.1s", 1000L to "+1s").forEach { (deltaMs, label) ->
+                        OutlinedButton(
+                            onClick = {
+                                isDraggingSlider = false
+                                selectedPositionMs = (selectedPositionMs + deltaMs).coerceIn(0f, durationMs.toFloat().coerceAtLeast(1f))
+                            },
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                            modifier = Modifier.height(34.dp)
+                        ) {
+                            Text(text = label, fontSize = 11.sp, maxLines = 1)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Hàng nút hành động dưới cùng: CANCEL + USE THIS FRAME
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = onCancelImport,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.7f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error
+                        ),
+                        modifier = Modifier
+                            .weight(0.42f)
+                            .height(48.dp)
+                            .testTag("cancel_import_video_dialog_button")
+                    ) {
+                        Text(
+                            text = "CANCEL",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.8.sp,
+                            maxLines = 1
+                        )
+                    }
+
+                    Button(
+                        onClick = { onConfirm(currentPreviewBitmap) },
+                        enabled = !isExtractingExactFrame,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = MaterialTheme.colorScheme.primary,
+                            disabledContainerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.75f)
+                        ),
+                        modifier = Modifier
+                            .weight(0.58f)
+                            .height(48.dp)
+                            .testTag("confirm_video_frame_button")
+                    ) {
+                        AnimatedContent(
+                            targetState = isExtractingExactFrame,
+                            transitionSpec = {
+                                fadeIn(tween(140)).togetherWith(fadeOut(tween(100)))
+                            },
+                            label = "use_frame_btn_state"
+                        ) { extracting ->
+                            if (extracting) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        color = MaterialTheme.colorScheme.onPrimary,
+                                        strokeWidth = 2.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "EXTRACTING...",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 0.8.sp,
+                                        color = MaterialTheme.colorScheme.onPrimary,
+                                        maxLines = 1
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    text = "USE THIS FRAME",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.8.sp,
+                                    color = MaterialTheme.colorScheme.onPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun formatMillisPrecise(millis: Long): String {
+    val safeMs = millis.coerceAtLeast(0L)
+    val totalSec = safeMs / 1000
+    val minutes = totalSec / 60
+    val seconds = totalSec % 60
+    val tenths = (safeMs % 1000) / 100
+    return "%02d:%02d.%d".format(minutes, seconds, tenths)
 }
 
 @Composable
@@ -453,19 +1667,19 @@ fun GalleryGridItem(
     item: VaultItem,
     imageLoader: ImageLoader?,
     isAnimating: Boolean = false,
+    isSelectionMode: Boolean = false,
+    isSelected: Boolean = false,
     onItemClick: (FloatArray?) -> Unit,
-    onPositioned: (FloatArray) -> Unit
+    onPositioned: (FloatArray) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     var itemBounds by remember { mutableStateOf<FloatArray?>(null) }
 
-    // Trong Composable GalleryGridItem, thay đổi painter thành:
     val thumbUriWithTier = item.uri.buildUpon().appendQueryParameter("tier", "THUMB").build()
     val painter = if (imageLoader != null) {
         rememberAsyncImagePainter(
             model = ImageRequest.Builder(LocalContext.current)
                 .data(thumbUriWithTier)
-                // ÉP COIL GIỮ NGUYÊN KÍCH THƯỚC GỐC CỦA THUMBNAIL TỪ FILE
-                // KHÔNG cho phép Coil dùng chế độ FIT để bóp méo ảnh trước khi giao cho Compose
                 .size(Size.ORIGINAL)
                 .build(),
             imageLoader = imageLoader
@@ -476,27 +1690,39 @@ fun GalleryGridItem(
     var intrinsicWidth by remember { mutableStateOf(0f) }
     var intrinsicHeight by remember { mutableStateOf(0f) }
 
-    if (painterState is coil.compose.AsyncImagePainter.State.Success) {
-        intrinsicWidth = painterState.result.drawable.intrinsicWidth.toFloat()
-        intrinsicHeight = painterState.result.drawable.intrinsicHeight.toFloat()
+    val isImageLoaded = painterState is coil.compose.AsyncImagePainter.State.Success
+    if (isImageLoaded) {
+        val success = painterState as coil.compose.AsyncImagePainter.State.Success
+        intrinsicWidth = success.result.drawable.intrinsicWidth.toFloat()
+        intrinsicHeight = success.result.drawable.intrinsicHeight.toFloat()
     }
 
-    // Ghi thẳng bitmap vừa decode xong vào cache dùng chung (xem ThumbBitmapCache ở đầu
-    // file). Chỉ ghi 1 lần khi Coil vừa Success cho item này, không ghi lại mỗi recomposition.
+    val imageLoadedAlpha by animateFloatAsState(
+        targetValue = if (isImageLoaded) 1f else 0f,
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "thumb_fade_in"
+    )
+
+    val selectedScale by animateFloatAsState(
+        targetValue = if (isSelectionMode && isSelected) 0.88f else 1f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioNoBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "grid_item_selected_scale"
+    )
+    val selectedCornerDp by animateDpAsState(
+        targetValue = if (isSelectionMode && isSelected) 8.dp else 0.dp,
+        animationSpec = tween(180),
+        label = "grid_item_selected_corner"
+    )
+
     LaunchedEffect(item.encryptedName, painterState) {
         val successState = painterState as? coil.compose.AsyncImagePainter.State.Success ?: return@LaunchedEffect
         val bmp = (successState.result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap ?: return@LaunchedEffect
         ThumbBitmapCache.put(item.encryptedName, bmp.asImageBitmap())
     }
 
-    // FIX (giống logic myapp: luôn lấy đúng kích thước thật của ảnh đã load,
-    // không tin vào một giá trị "chụp" từ trước có thể còn là 0).
-    // onGloballyPositioned chỉ bắn lại khi position/size của Box đổi. Nhưng Box này
-    // bị ép .aspectRatio(1f) cố định vuông, nên khi Coil load xong thumbnail và
-    // intrinsicWidth/Height cập nhật từ 0 -> giá trị thật, layout KHÔNG đổi
-    // -> onGloballyPositioned không re-fire -> bounds gửi lên ViewModel bị "kẹt"
-    // ở intrinsic = 0 mãi mãi. Đây là nguyên nhân gốc gây méo ảnh.
-    // Nên phải tự đẩy lại bounds mỗi khi biết được kích thước thật của ảnh.
     LaunchedEffect(intrinsicWidth, intrinsicHeight) {
         if (intrinsicWidth > 0f && intrinsicHeight > 0f) {
             itemBounds?.let { b ->
@@ -508,12 +1734,11 @@ fun GalleryGridItem(
     }
 
     Box(
-        modifier = Modifier
+        modifier = modifier
             .aspectRatio(1f)
             .graphicsLayer {
                 alpha = if (isAnimating) 0f else 1f
             }
-            // Đã xóa bỏ .clip(RoundedCornerShape(...)) để thumb không bo tròn
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .onGloballyPositioned { coordinates ->
                 val position = coordinates.positionInWindow()
@@ -530,42 +1755,51 @@ fun GalleryGridItem(
                 onPositioned(bounds)
             }
             .clickable {
-                // itemBounds đã luôn được cập nhật intrinsic thật (xem LaunchedEffect ở trên),
-                // nên không cần tự dựng lại FloatArray thủ công nữa.
                 onItemClick(itemBounds)
             }
             .testTag("grid_item_${item.encryptedName}")
     ) {
-        if (painter != null) {
-            // Decrypt and load thumbnail sidecar securely on-the-fly, avoiding raw file loading to prevent OOM
-            Image(
-                painter = painter,
-                contentDescription = item.originalName,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize()
-            )
-        } else {
-            // Fallback placeholder (Never touches raw original file to prevent OOM)
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center
-            ) {
-                Icon(
-                    imageVector = if (item.isVideo) Icons.Filled.Videocam else Icons.Filled.Image,
-                    contentDescription = "Placeholder",
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                    modifier = Modifier.size(24.dp)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = selectedScale
+                    scaleY = selectedScale
+                }
+                .clip(RoundedCornerShape(selectedCornerDp))
+        ) {
+            if (!isImageLoaded) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (item.isVideo) Icons.Filled.Videocam else Icons.Filled.Image,
+                        contentDescription = "Placeholder",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
+
+            if (painter != null) {
+                Image(
+                    painter = painter,
+                    contentDescription = item.originalName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { alpha = imageLoadedAlpha }
                 )
             }
         }
 
-        // Overlay status indicators
         if (item.isVideo) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.BottomEnd)
+                    .align(if (isSelectionMode) Alignment.BottomStart else Alignment.BottomEnd)
                     .padding(4.dp)
                     .clip(RoundedCornerShape(4.dp))
                     .background(Color.Black.copy(alpha = 0.6f))
@@ -579,6 +1813,51 @@ fun GalleryGridItem(
                 )
             }
         }
+
+        AnimatedVisibility(
+            visible = isSelectionMode,
+            enter = scaleIn(animationSpec = spring(dampingRatio = 0.65f, stiffness = 500f)) + fadeIn(tween(150)),
+            exit = scaleOut(animationSpec = tween(130)) + fadeOut(tween(130)),
+            modifier = Modifier.align(Alignment.BottomEnd)
+        ) {
+            val checkBgColor by animateColorAsState(
+                targetValue = if (isSelected) MaterialTheme.colorScheme.primary else Color.Black.copy(alpha = 0.55f),
+                animationSpec = tween(150),
+                label = "checkbox_bg_color"
+            )
+            val checkBorderColor by animateColorAsState(
+                targetValue = if (isSelected) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.85f),
+                animationSpec = tween(150),
+                label = "checkbox_border_color"
+            )
+            Box(
+                modifier = Modifier
+                    .padding(5.dp)
+                    .size(20.dp)
+                    .clip(RoundedCornerShape(5.dp))
+                    .background(checkBgColor)
+                    .border(
+                        width = 1.5.dp,
+                        color = checkBorderColor,
+                        shape = RoundedCornerShape(5.dp)
+                    )
+                    .testTag("checkbox_${item.encryptedName}"),
+                contentAlignment = Alignment.Center
+            ) {
+                androidx.compose.animation.AnimatedVisibility(
+                    visible = isSelected,
+                    enter = scaleIn(spring(dampingRatio = 0.6f)) + fadeIn(tween(100)),
+                    exit = scaleOut(tween(90)) + fadeOut(tween(90))
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Check,
+                        contentDescription = "Selected",
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -590,13 +1869,11 @@ private fun formatGroupDate(timestamp: Long): String {
 
     val format = java.text.SimpleDateFormat("MMMM d, yyyy", java.util.Locale.getDefault())
 
-    // Check if it's today
     if (now.get(java.util.Calendar.YEAR) == cal.get(java.util.Calendar.YEAR) &&
         now.get(java.util.Calendar.DAY_OF_YEAR) == cal.get(java.util.Calendar.DAY_OF_YEAR)) {
         return "Today"
     }
 
-    // Check if it's yesterday
     val yesterday = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -1) }
     if (yesterday.get(java.util.Calendar.YEAR) == cal.get(java.util.Calendar.YEAR) &&
         yesterday.get(java.util.Calendar.DAY_OF_YEAR) == cal.get(java.util.Calendar.DAY_OF_YEAR)) {

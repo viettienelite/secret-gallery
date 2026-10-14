@@ -6,8 +6,18 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
-import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -29,11 +39,6 @@ class MainActivity : ComponentActivity() {
         vaultViewModel.loadSavedVaultUri(this)
         enableEdgeToEdge()
 
-        // Tắt animation mặc định của hệ điều hành khi Activity này chuyển cảnh (mở Document
-        // Picker để import nhiều file, rồi quay lại). Animation hệ thống (phóng to/mờ dần nền
-        // đen) chạy song song và đè lên animation Compose tự vẽ (AnimatedVisibility) của popup
-        // tiến trình import, gây ra hiệu ứng "nền đen phóng to lên" người dùng thấy. Từ giờ chỉ
-        // còn animation do chính app tự viết (trong GalleryScreen) đảm nhiệm việc này.
         window.setWindowAnimations(0)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             overrideActivityTransition(OVERRIDE_TRANSITION_OPEN, 0, 0)
@@ -54,19 +59,48 @@ class MainActivity : ComponentActivity() {
                 val dek by vaultViewModel.dek.collectAsState()
                 val selectedMedia by vaultViewModel.selectedMedia.collectAsState()
 
+                val isVaultUnlocked = vaultUri != null && dek != null
+
                 Scaffold(
-                    modifier = Modifier.fillMaxSize()
-                ) { innerPadding ->
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background)
+                ) { _ ->
                     val screenModifier = Modifier.fillMaxSize()
 
-                    when {
-                        vaultUri == null || dek == null -> {
+                    // Chuyển cảnh mượt mà (Fade + Scale nhẹ) khi mở khóa vào Gallery hoặc khóa về trang chủ
+                    AnimatedContent(
+                        targetState = isVaultUnlocked,
+                        transitionSpec = {
+                            if (targetState) {
+                                // Mở khóa: Gallery phóng nhẹ từ 95% -> 100% kèm fade-in
+                                (fadeIn(animationSpec = tween(300, easing = FastOutSlowInEasing)) +
+                                        scaleIn(initialScale = 0.95f, animationSpec = tween(300, easing = FastOutSlowInEasing)))
+                                    .togetherWith(
+                                        fadeOut(animationSpec = tween(200)) +
+                                                scaleOut(targetScale = 1.04f, animationSpec = tween(200))
+                                    )
+                            } else {
+                                // Khóa Vault: thu nhẹ về trang chủ
+                                (fadeIn(animationSpec = tween(260, easing = FastOutSlowInEasing)) +
+                                        scaleIn(initialScale = 1.04f, animationSpec = tween(260, easing = FastOutSlowInEasing)))
+                                    .togetherWith(
+                                        fadeOut(animationSpec = tween(200)) +
+                                                scaleOut(targetScale = 0.95f, animationSpec = tween(200))
+                                    )
+                            }
+                        },
+                        label = "vault_unlock_screen_transition",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.background)
+                    ) { unlocked ->
+                        if (!unlocked) {
                             WelcomeScreen(
                                 viewModel = vaultViewModel,
                                 modifier = screenModifier
                             )
-                        }
-                        else -> {
+                        } else {
                             Box(modifier = Modifier.fillMaxSize()) {
                                 GalleryScreen(
                                     viewModel = vaultViewModel,
@@ -89,9 +123,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        // overridePendingTransition() (API < 34) chỉ áp dụng cho lượt chuyển cảnh kế tiếp, nên
-        // cần gọi lại mỗi lần quay lại Activity (ví dụ sau khi đóng Document Picker) để animation
-        // hệ thống luôn bị tắt, không riêng gì lần khởi động đầu tiên.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             @Suppress("DEPRECATION")
             overridePendingTransition(0, 0)

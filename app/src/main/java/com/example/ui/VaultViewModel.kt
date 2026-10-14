@@ -3,9 +3,15 @@ package com.example.ui
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.media.ExifInterface
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
+import android.os.VibrationAttributes
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModel
@@ -13,14 +19,21 @@ import androidx.lifecycle.viewModelScope
 import com.example.crypto.CryptoEngine
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 
 data class VaultItem(
     val originalName: String,
@@ -31,8 +44,41 @@ data class VaultItem(
     val dateTaken: Long
 )
 
+/**
+ * Yêu cầu hiển thị UI cho phép người dùng tự chọn frame bất kỳ của video
+ * để làm ảnh bìa (tạo cả Tier SCREEN 1080p và Tier THUMB 216p) khi import.
+ */
+data class VideoFramePickRequest(
+    val uri: Uri,
+    val fileName: String,
+    val queueIndex: Int,
+    val queueTotal: Int
+)
+
+private data class PendingImportItem(
+    val index: Int,
+    val uri: Uri,
+    val originalName: String,
+    val isVideo: Boolean
+)
+
+private class PrecomputedTiers(
+    val thumbBytes: ByteArray,
+    val screenBytes: ByteArray,
+    val dimensions: Pair<Int, Int>
+)
+
 class VaultViewModel : ViewModel() {
 
+    companion object {
+        const val THUMB_SIZE_PX = 216
+    }
+
+    // Danh sách các thư mục Vault đã ghi nhớ ở trang chủ
+    private val _savedVaults = MutableStateFlow<List<Uri>>(emptyList())
+    val savedVaults: StateFlow<List<Uri>> = _savedVaults.asStateFlow()
+
+    // Vault đang được người dùng click chọn để nhập password / mở khóa
     private val _vaultUri = MutableStateFlow<Uri?>(null)
     val vaultUri: StateFlow<Uri?> = _vaultUri.asStateFlow()
 
@@ -53,6 +99,24 @@ class VaultViewModel : ViewModel() {
 
     private val _importQueueIndex = MutableStateFlow(0)
     val importQueueIndex: StateFlow<Int> = _importQueueIndex.asStateFlow()
+
+    // Bitmap preview kích thước thật (216x216 px) và cờ báo loại file (ảnh/video) đang được mã hoá
+    private val _currentImportThumb = MutableStateFlow<Bitmap?>(null)
+    val currentImportThumb: StateFlow<Bitmap?> = _currentImportThumb.asStateFlow()
+
+    private val _currentImportIsVideo = MutableStateFlow(false)
+    val currentImportIsVideo: StateFlow<Boolean> = _currentImportIsVideo.asStateFlow()
+
+    // Trạng thái đang huỷ import & dọn dẹp các file đã lỡ tạo
+    private val _isCancellingImport = MutableStateFlow(false)
+    val isCancellingImport: StateFlow<Boolean> = _isCancellingImport.asStateFlow()
+
+    private var importJob: Job? = null
+    private val isImportCancelled = AtomicBoolean(false)
+
+    private val _videoFramePickRequest = MutableStateFlow<VideoFramePickRequest?>(null)
+    val videoFramePickRequest: StateFlow<VideoFramePickRequest?> = _videoFramePickRequest.asStateFlow()
+    private var videoFrameDeferred: CompletableDeferred<Bitmap?>? = null
 
     private val _error = MutableStateFlow<String?>(null)
     val error: StateFlow<String?> = _error.asStateFlow()
@@ -77,23 +141,108 @@ class VaultViewModel : ViewModel() {
         _animatingItem.value = encryptedName
     }
 
+    /**
+     * Được gọi từ VideoFramePickerDialog khi người dùng đã chọn xong frame ưng ý.
+     */
+    fun confirmVideoFrameSelection(chosenBitmap: Bitmap?) {
+        videoFrameDeferred?.complete(chosenBitmap)
+        videoFrameDeferred = null
+    }
+
+    /**
+     * Huỷ toàn bộ quá trình import bất cứ lúc nào (cả khi đang chọn thumb video lẫn khi đang mã hoá)
+     * và xoá sạch toàn bộ các file đã lỡ mã hoá trong đợt import hiện tại.
+     */
+    fun cancelImport() {
+        if (!_isLoading.value && _videoFramePickRequest.value == null) return
+        isImportCancelled.set(true)
+        _isCancellingImport.value = true
+        _videoFramePickRequest.value = null
+        videoFrameDeferred?.cancel(CancellationException("Import cancelled by user"))
+        videoFrameDeferred = null
+        importJob?.cancel(CancellationException("Import cancelled by user"))
+    }
+
+    /**
+     * Tải danh sách các Vault đã ghi nhớ từ SharedPreferences khi mở app.
+     */
     fun loadSavedVaultUri(context: Context) {
         val prefs = context.getSharedPreferences("vault_prefs", Context.MODE_PRIVATE)
-        val uriStr = prefs.getString("saved_vault_uri", null)
-        if (uriStr != null) {
+        val persistedSet = context.contentResolver.persistedUriPermissions
+            .filter { it.isReadPermission }
+            .map { it.uri.toString() }
+            .toSet()
+
+        val loadedUris = mutableListOf<Uri>()
+        val jsonStr = prefs.getString("saved_vault_uris_json", null)
+        if (!jsonStr.isNullOrEmpty()) {
             try {
-                val uri = Uri.parse(uriStr)
-                val hasPermission = context.contentResolver.persistedUriPermissions.any { it.uri == uri }
-                if (hasPermission) _vaultUri.value = uri
-            } catch (e: Exception) {}
+                val arr = JSONArray(jsonStr)
+                for (i in 0 until arr.length()) {
+                    val uStr = arr.optString(i)
+                    if (uStr.isNotEmpty() && uStr in persistedSet) {
+                        val parsed = Uri.parse(uStr)
+                        if (parsed !in loadedUris) loadedUris.add(parsed)
+                    }
+                }
+            } catch (_: Exception) {}
         }
+
+        val legacyUriStr = prefs.getString("saved_vault_uri", null)
+        if (!legacyUriStr.isNullOrEmpty() && legacyUriStr in persistedSet) {
+            try {
+                val legacyUri = Uri.parse(legacyUriStr)
+                if (legacyUri !in loadedUris) {
+                    loadedUris.add(0, legacyUri)
+                }
+            } catch (_: Exception) {}
+        }
+
+        _savedVaults.value = loadedUris
+        saveVaultListToPrefs(context, loadedUris)
+    }
+
+    private fun saveVaultListToPrefs(context: Context, list: List<Uri>) {
+        val prefs = context.getSharedPreferences("vault_prefs", Context.MODE_PRIVATE)
+        val arr = JSONArray()
+        list.forEach { arr.put(it.toString()) }
+        prefs.edit()
+            .putString("saved_vault_uris_json", arr.toString())
+            .apply()
     }
 
     fun setVaultUri(context: Context, uri: Uri?) {
-        _vaultUri.value = uri; _dek.value = null; _items.value = emptyList(); _error.value = null
-        val prefs = context.getSharedPreferences("vault_prefs", Context.MODE_PRIVATE)
-        if (uri != null) prefs.edit().putString("saved_vault_uri", uri.toString()).apply()
-        else prefs.edit().remove("saved_vault_uri").apply()
+        _dek.value?.fill(0)
+        _dek.value = null
+        _items.value = emptyList()
+        _error.value = null
+
+        if (uri == null) {
+            _vaultUri.value = null
+            return
+        }
+
+        val currentList = _savedVaults.value.toMutableList()
+        currentList.remove(uri)
+        currentList.add(0, uri)
+        _savedVaults.value = currentList
+        saveVaultListToPrefs(context, currentList)
+
+        _vaultUri.value = uri
+    }
+
+    fun removeSavedVault(context: Context, uri: Uri) {
+        val updated = _savedVaults.value.filterNot { it == uri }
+        _savedVaults.value = updated
+        saveVaultListToPrefs(context, updated)
+        if (_vaultUri.value == uri) {
+            _vaultUri.value = null
+            _error.value = null
+        }
+    }
+
+    fun setError(message: String?) {
+        _error.value = message
     }
 
     fun clearError() { _error.value = null }
@@ -124,7 +273,15 @@ class VaultViewModel : ViewModel() {
         }
     }
 
-    fun lockVault() { _dek.value = null; _items.value = emptyList(); _selectedMedia.value = null }
+    fun lockVault() {
+        cancelImport()
+        _dek.value?.fill(0)
+        _dek.value = null
+        _vaultUri.value = null
+        _items.value = emptyList()
+        _selectedMedia.value = null
+        _error.value = null
+    }
 
     fun loadVaultItems(context: Context) {
         val uri = _vaultUri.value ?: return
@@ -183,56 +340,258 @@ class VaultViewModel : ViewModel() {
     }
 
     /**
-     * Import nhiều file cùng lúc. Cả hàng đợi dùng chung 1 trạng thái _isLoading duy nhất
-     * (không bật/tắt qua lại giữa các file) để overlay không bị chớp (flicker) khi chuyển file.
-     * File lỗi sẽ bị bỏ qua và gộp báo lỗi ở cuối, không làm dừng cả hàng đợi.
+     * Bulk Import bằng cách chọn 1 Folder:
+     * Quét đệ quy toàn bộ các file ảnh & video hợp lệ bên trong thư mục được chọn,
+     * sau đó chuyển thẳng vào hàng đợi importMultipleMedia.
+     */
+    fun importFolderMedia(context: Context, folderTreeUri: Uri) {
+        if (_vaultUri.value == null || _dek.value == null) return
+
+        importJob?.cancel()
+        isImportCancelled.set(false)
+        _isCancellingImport.value = false
+
+        importJob = viewModelScope.launch {
+            _isLoading.value = true
+            _importProgress.value = 0f
+            _error.value = null
+
+            val discoveredUris = try {
+                withContext(Dispatchers.IO) {
+                    collectMediaUrisFromTree(context, folderTreeUri)
+                }
+            } catch (e: CancellationException) {
+                _isLoading.value = false
+                _isCancellingImport.value = false
+                return@launch
+            } catch (e: Exception) {
+                _isLoading.value = false
+                _isCancellingImport.value = false
+                _error.value = "Failed to scan folder: ${e.message}"
+                return@launch
+            }
+
+            if (isImportCancelled.get()) {
+                _isLoading.value = false
+                _isCancellingImport.value = false
+                return@launch
+            }
+
+            if (discoveredUris.isEmpty()) {
+                _isLoading.value = false
+                _isCancellingImport.value = false
+                _error.value = "No photos or videos found in the selected folder."
+                return@launch
+            }
+
+            runImportPipeline(context, discoveredUris)
+        }
+    }
+
+    private fun collectMediaUrisFromTree(context: Context, treeUri: Uri): List<Uri> {
+        val result = mutableListOf<Uri>()
+        val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+
+        fun traverseDirectory(parentDocId: String) {
+            if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            )
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+                    val docId = cursor.getString(0) ?: continue
+                    val displayName = cursor.getString(1) ?: ""
+                    val mimeType = cursor.getString(2) ?: ""
+
+                    if (displayName.startsWith(".") || displayName == "vault.conf" || displayName.endsWith(".enc")) {
+                        continue
+                    }
+
+                    if (mimeType == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        traverseDirectory(docId)
+                    } else if (isSupportedMediaFile(displayName, mimeType)) {
+                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                        result.add(fileUri)
+                    }
+                }
+            }
+        }
+
+        traverseDirectory(rootDocId)
+        return result
+    }
+
+    private fun isSupportedMediaFile(fileName: String, mimeType: String): Boolean {
+        if (mimeType.startsWith("image/") || mimeType.startsWith("video/")) return true
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val imageExts = setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "avif", "gif", "bmp", "dng")
+        return ext in imageExts || isVideoFile(fileName)
+    }
+
+    /**
+     * Import nhiều file cùng lúc.
      */
     fun importMultipleMedia(context: Context, sourceUris: List<Uri>) {
+        if (_vaultUri.value == null || _dek.value == null || sourceUris.isEmpty()) return
+
+        importJob?.cancel()
+        isImportCancelled.set(false)
+        _isCancellingImport.value = false
+
+        importJob = viewModelScope.launch {
+            runImportPipeline(context, sourceUris)
+        }
+    }
+
+    /**
+     * Pipeline import 3 giai đoạn có hỗ trợ Cancel & Rollback (xoá toàn bộ file đã tạo nếu huỷ giữa chừng):
+     * - Giai đoạn 1: Chọn thumbnail cho TOÀN BỘ video ngay bước đầu (chưa mã hoá vội).
+     * - Giai đoạn 2: Mã hoá một mạch toàn bộ ảnh + video, đồng thời hiển thị preview thumb 216x216 px
+     *   bên trong vòng tròn tiến trình.
+     * - Giai đoạn 3: Rung 3 cái khi hoàn tất (hoặc xoá sạch các file đã lỡ import nếu bấm Cancel).
+     */
+    private suspend fun runImportPipeline(context: Context, sourceUris: List<Uri>) {
         val vaultUriVal = _vaultUri.value ?: return
         val key = _dek.value ?: return
         if (sourceUris.isEmpty()) return
 
-        viewModelScope.launch {
-            _isLoading.value = true
-            _importProgress.value = 0f
-            _importQueueTotal.value = sourceUris.size
-            _importQueueIndex.value = 0
-            _error.value = null
+        _isLoading.value = true
+        _importProgress.value = 0f
+        _importQueueTotal.value = sourceUris.size
+        _importQueueIndex.value = 0
+        _currentImportThumb.value = null
+        _currentImportIsVideo.value = false
+        _error.value = null
 
-            val failedNames = mutableListOf<String>()
-            val totalFiles = sourceUris.size
+        val failedNames = mutableListOf<String>()
+        val totalFiles = sourceUris.size
+        // Danh sách toàn bộ các file .enc đã được tạo trong đợt import này để xoá sạch nếu người dùng Cancel
+        val createdVaultUris = Collections.synchronizedList(mutableListOf<Uri>())
 
-            try {
-                withContext(Dispatchers.IO) {
-                    sourceUris.forEachIndexed { index, sourceUri ->
-                        _importQueueIndex.value = index + 1
-                        try {
-                            // Gộp % của từng file vào 1 thanh tiến độ tổng duy nhất cho cả hàng đợi:
-                            // progress hiển thị = (số file đã xong + % file đang chạy) / tổng số file,
-                            // nên thanh tiến độ luôn tăng dần liên tục từ 0% -> 100%, không bị "nhảy về 0"
-                            // mỗi khi bắt đầu một file mới.
-                            importSingleFile(context, vaultUriVal, key, sourceUri) { fileProgress ->
-                                _importProgress.value = (index + fileProgress) / totalFiles
+        try {
+            val pendingItems = withContext(Dispatchers.IO) {
+                sourceUris.mapIndexed { index, uri ->
+                    if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+                    val name = getFileNameFromUri(context, uri) ?: "import_${System.currentTimeMillis()}_$index"
+                    PendingImportItem(
+                        index = index,
+                        uri = uri,
+                        originalName = name,
+                        isVideo = isVideoFile(name)
+                    )
+                }
+            }
+
+            // GIAI ĐOẠN 1: Chọn thumbnail cho TOÀN BỘ video ngay bước đầu
+            val videoItems = pendingItems.filter { it.isVideo }
+            val precomputedVideoTiers = mutableMapOf<Int, PrecomputedTiers>()
+
+            if (videoItems.isNotEmpty()) {
+                videoItems.forEachIndexed { videoIdx, videoItem ->
+                    if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+
+                    val deferred = CompletableDeferred<Bitmap?>()
+                    videoFrameDeferred = deferred
+                    _videoFramePickRequest.value = VideoFramePickRequest(
+                        uri = videoItem.uri,
+                        fileName = videoItem.originalName,
+                        queueIndex = videoIdx + 1,
+                        queueTotal = videoItems.size
+                    )
+
+                    val chosenBitmap = deferred.await()
+                    if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+
+                    val tiers = withContext(Dispatchers.IO) {
+                        val (thumbBytes, screenBytes, dimensions) = generateTierBitmaps(
+                            context = context,
+                            uri = videoItem.uri,
+                            isVideo = true,
+                            chosenVideoFrame = chosenBitmap,
+                            recycleInputBitmap = false
+                        )
+                        PrecomputedTiers(thumbBytes, screenBytes, dimensions)
+                    }
+                    precomputedVideoTiers[videoItem.index] = tiers
+                }
+                _videoFramePickRequest.value = null
+            }
+
+            // GIAI ĐOẠN 2: Mã hoá liên tục toàn bộ danh sách file
+            withContext(Dispatchers.IO) {
+                pendingItems.forEachIndexed { index, item ->
+                    if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+                    _importQueueIndex.value = index + 1
+                    try {
+                        importSingleFile(
+                            context = context,
+                            vaultUriVal = vaultUriVal,
+                            key = key,
+                            item = item,
+                            precomputedTiers = precomputedVideoTiers[item.index],
+                            createdVaultUris = createdVaultUris
+                        ) { fileProgress ->
+                            if (isImportCancelled.get()) {
+                                throw CancellationException("Import cancelled")
                             }
-                        } catch (e: Exception) {
-                            failedNames.add(getFileNameFromUri(context, sourceUri) ?: sourceUri.toString())
-                            // File lỗi vẫn được tính là "đã xong" để thanh tiến độ tổng tiếp tục nhảy
-                            // đúng mốc của file kế tiếp thay vì đứng yên.
-                            _importProgress.value = (index + 1f) / totalFiles
+                            _importProgress.value = (index + fileProgress) / totalFiles
                         }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        failedNames.add(item.originalName)
+                        _importProgress.value = (index + 1f) / totalFiles
                     }
                 }
-                loadVaultItems(context)
-                if (failedNames.isNotEmpty()) {
-                    _error.value = if (failedNames.size == 1) {
-                        "Failed to import: ${failedNames.first()}"
-                    } else {
-                        "Failed to import ${failedNames.size} of ${sourceUris.size} files"
-                    }
+            }
+
+            if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+
+            _items.value = withContext(Dispatchers.IO) { scanFiles(context, vaultUriVal, key) }
+
+            if (failedNames.isNotEmpty()) {
+                _error.value = if (failedNames.size == 1) {
+                    "Failed to import: ${failedNames.first()}"
+                } else {
+                    "Failed to import ${failedNames.size} of ${sourceUris.size} files"
                 }
-            } catch (e: Exception) {
+            }
+
+            // GIAI ĐOẠN 3: Rung 3 cái báo hiệu hoàn tất
+            vibrateThreeTimes(context)
+        } catch (e: CancellationException) {
+            // Người dùng bấm Cancel -> Xoá toàn bộ các file .enc đã lỡ tạo trong đợt import này
+            withContext(NonCancellable + Dispatchers.IO) {
+                val snapshot = synchronized(createdVaultUris) { createdVaultUris.toList() }
+                snapshot.forEach { uriToDelete ->
+                    CryptoEngine.deleteFile(context, uriToDelete)
+                }
+                _items.value = scanFiles(context, vaultUriVal, key)
+            }
+        } catch (e: Exception) {
+            if (isImportCancelled.get()) {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    val snapshot = synchronized(createdVaultUris) { createdVaultUris.toList() }
+                    snapshot.forEach { uriToDelete ->
+                        CryptoEngine.deleteFile(context, uriToDelete)
+                    }
+                    _items.value = scanFiles(context, vaultUriVal, key)
+                }
+            } else {
                 _error.value = "Import failed: ${e.message}"
-            } finally {
+            }
+        } finally {
+            withContext(NonCancellable) {
+                _videoFramePickRequest.value = null
+                videoFrameDeferred = null
+                _currentImportThumb.value = null
+                _currentImportIsVideo.value = false
+                _isCancellingImport.value = false
+                isImportCancelled.set(false)
                 _isLoading.value = false
                 _importProgress.value = 0f
                 _importQueueTotal.value = 0
@@ -241,64 +600,217 @@ class VaultViewModel : ViewModel() {
         }
     }
 
-    /** Mã hoá & lưu 1 file vào vault (chạy trên Dispatchers.IO). Ném exception nếu lỗi để hàm gọi xử lý tiếp file kế tiếp. */
-    private fun importSingleFile(context: Context, vaultUriVal: Uri, key: ByteArray, sourceUri: Uri, onProgress: (Float) -> Unit) {
-        val originalName = getFileNameFromUri(context, sourceUri) ?: "import_${System.currentTimeMillis()}"
-        val isVideo = isVideoFile(originalName)
+    /**
+     * Mã hoá & lưu 1 file vào vault (chạy trên Dispatchers.IO).
+     * Cập nhật _currentImportThumb (hình vuông 216x216 px) và _currentImportIsVideo ngay trước khi mã hoá các block.
+     */
+    private fun importSingleFile(
+        context: Context,
+        vaultUriVal: Uri,
+        key: ByteArray,
+        item: PendingImportItem,
+        precomputedTiers: PrecomputedTiers? = null,
+        createdVaultUris: MutableList<Uri>,
+        onProgress: (Float) -> Unit
+    ) {
+        if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+
+        val sourceUri = item.uri
+        val originalName = item.originalName
+        val isVideo = item.isVideo
         val sourceSize = getFileSizeFromUri(context, sourceUri)
 
-        // Sử dụng hàm getActualDateTaken đọc thẳng từ EXIF/Video Metadata
-        val dateTaken = getActualDateTaken(context, sourceUri, isVideo)
+        // Khởi tạo hoặc lấy sẵn 2 tier (THUMB 216p & SCREEN 1080p)
+        val (thumbBytes, screenBytes, dimensions) = if (precomputedTiers != null) {
+            Triple(precomputedTiers.thumbBytes, precomputedTiers.screenBytes, precomputedTiers.dimensions)
+        } else {
+            generateTierBitmaps(
+                context = context,
+                uri = sourceUri,
+                isVideo = isVideo,
+                chosenVideoFrame = null
+            )
+        }
 
+        // Giải mã thumbBytes ra Bitmap vuông 216x216 px để hiển thị ngay trong vòng tròn tiến trình mã hoá
+        val rawThumbBmp = BitmapFactory.decodeByteArray(thumbBytes, 0, thumbBytes.size)
+        if (rawThumbBmp != null) {
+            _currentImportIsVideo.value = isVideo
+            _currentImportThumb.value = cropCenterSquareBitmap(rawThumbBmp, THUMB_SIZE_PX)
+            if (_currentImportThumb.value !== rawThumbBmp) {
+                rawThumbBmp.recycle()
+            }
+        }
+
+        if (isImportCancelled.get()) throw CancellationException("Import cancelled")
+
+        val dateTaken = getActualDateTaken(context, sourceUri, isVideo)
         val combinedMetadata = "$dateTaken|$originalName"
         val encryptedName = CryptoEngine.encryptFileName(combinedMetadata, key)
 
         val encryptedFileUri = CryptoEngine.createChildFile(context, vaultUriVal, encryptedName)
             ?: throw java.io.IOException("Could not create SGV2 file in Vault")
 
-        // Khởi tạo 2 tier resize (Thumbnail & Screen)
-        val (thumbBytes, screenBytes) = generateTierBitmaps(context, sourceUri, isVideo)
+        // Ghi nhận ngay URI vừa tạo để nếu hủy giữa chừng (đang ghi dở) cũng sẽ bị xóa sạch
+        createdVaultUris.add(encryptedFileUri)
 
-        // Lưu toàn bộ 3 Tier gộp 1 File, báo % tiến độ khi mã hoá block Full-tier
-        CryptoEngine.encryptSgv2File(
-            context = context,
-            sourceUri = sourceUri,
-            destUri = encryptedFileUri,
-            thumbBytes = thumbBytes,
-            screenBytes = screenBytes,
-            dek = key,
-            sourceSize = sourceSize,
-            onProgress = { progress -> onProgress(progress) }
-        )
+        try {
+            CryptoEngine.encryptSgv2File(
+                context = context,
+                sourceUri = sourceUri,
+                destUri = encryptedFileUri,
+                thumbBytes = thumbBytes,
+                screenBytes = screenBytes,
+                dek = key,
+                sourceSize = sourceSize,
+                mediaWidth = dimensions.first,
+                mediaHeight = dimensions.second,
+                onProgress = { progress -> onProgress(progress) }
+            )
+        } catch (e: Exception) {
+            if (!isImportCancelled.get()) {
+                CryptoEngine.deleteFile(context, encryptedFileUri)
+                createdVaultUris.remove(encryptedFileUri)
+            }
+            throw e
+        }
     }
 
-    // Trong file VaultViewModel.kt
-    private fun generateTierBitmaps(context: Context, uri: Uri, isVideo: Boolean): Pair<ByteArray, ByteArray> {
-        val baseBmp = if (isVideo) {
-            val retriever = MediaMetadataRetriever()
-            retriever.setDataSource(context, uri)
-            retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC) ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+    /**
+     * Cắt chính giữa thành hình vuông chuẩn kích thước thật (216 x 216 px).
+     */
+    private fun cropCenterSquareBitmap(source: Bitmap, targetSizePx: Int): Bitmap {
+        val w = source.width.coerceAtLeast(1)
+        val h = source.height.coerceAtLeast(1)
+        val edge = minOf(w, h)
+        val offsetX = (w - edge) / 2
+        val offsetY = (h - edge) / 2
+        val cropped = Bitmap.createBitmap(source, offsetX, offsetY, edge, edge)
+        if (cropped.width == targetSizePx && cropped.height == targetSizePx) {
+            return cropped
+        }
+        val scaled = Bitmap.createScaledBitmap(cropped, targetSizePx, targetSizePx, true)
+        if (scaled !== cropped && cropped !== source) {
+            cropped.recycle()
+        }
+        return scaled
+    }
+
+    /**
+     * Phát 3 nhịp rung rõ ràng khi hoàn tất mã hoá toàn bộ hàng đợi import.
+     */
+    private fun vibrateThreeTimes(context: Context) {
+        try {
+            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val manager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+                manager?.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            } ?: return
+
+            if (!vibrator.hasVibrator()) return
+
+            val timings = longArrayOf(0L, 120L, 100L, 120L, 100L, 120L)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val amplitudes = intArrayOf(0, 255, 0, 255, 0, 255)
+                val effect = if (vibrator.hasAmplitudeControl()) {
+                    VibrationEffect.createWaveform(timings, amplitudes, -1)
+                } else {
+                    VibrationEffect.createWaveform(timings, -1)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val attrs = VibrationAttributes.Builder()
+                        .setUsage(VibrationAttributes.USAGE_NOTIFICATION)
+                        .build()
+                    vibrator.vibrate(effect, attrs)
+                } else {
+                    vibrator.vibrate(effect)
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(timings, -1)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Tạo đồng thời 2 tier (THUMB 216p & SCREEN 1080p) và trả về kèm kích thước gốc (width, height)
+     * để ghi vào Header SGV2.
+     */
+    private fun generateTierBitmaps(
+        context: Context,
+        uri: Uri,
+        isVideo: Boolean,
+        chosenVideoFrame: Bitmap? = null,
+        recycleInputBitmap: Boolean = true
+    ): Triple<ByteArray, ByteArray, Pair<Int, Int>> {
+        var origW = 0
+        var origH = 0
+
+        val baseBmp: Bitmap = if (isVideo) {
+            if (chosenVideoFrame != null) {
+                origW = chosenVideoFrame.width
+                origH = chosenVideoFrame.height
+                chosenVideoFrame
+            } else {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(context, uri)
+                    origW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+                    origH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+                    retriever.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+                } finally {
+                    try { retriever.release() } catch (_: Exception) {}
+                }
+            }
         } else {
             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+            origW = options.outWidth.coerceAtLeast(0)
+            origH = options.outHeight.coerceAtLeast(0)
+
+            val exifRotation = getExifRotationDegrees(context, uri)
+            if (exifRotation == 90 || exifRotation == 270) {
+                val tmp = origW
+                origW = origH
+                origH = tmp
+            }
+
             val decodeOptions = BitmapFactory.Options().apply {
                 inSampleSize = calculateInSampleSize(options, 2048, 2048)
             }
-            context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, decodeOptions) }
-                ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+            val decoded = context.contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, decodeOptions)
+            } ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
+
+            if (exifRotation != 0) {
+                val matrix = Matrix().apply { postRotate(exifRotation.toFloat()) }
+                val rotated = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, matrix, true)
+                if (rotated != decoded) decoded.recycle()
+                rotated
+            } else {
+                decoded
+            }
         }
 
-        val bw = baseBmp.width
-        val bh = baseBmp.height
+        val bw = baseBmp.width.coerceAtLeast(1)
+        val bh = baseBmp.height.coerceAtLeast(1)
+        if (origW <= 0 || origH <= 0) {
+            origW = bw
+            origH = bh
+        }
 
-        // 1. TẠO TIER SCREEN (Giữ nguyên 1080)
-        val screenScale = if (bw > 0) 1080f / bw else 1f
+        // 1. TẠO TIER SCREEN (1080p)
         val screenW = minOf(1080, bw)
         val screenH = (bh * (screenW.toFloat() / bw)).toInt().coerceAtLeast(1)
         val screenBmp = Bitmap.createScaledBitmap(baseBmp, screenW, screenH, true)
 
-        // 2. TẠO TIER THUMB (Giữ nguyên 216)
-        val thumbBmp = createSmoothThumbnail(screenBmp, 216)
+        // 2. TẠO TIER THUMB (216p)
+        val thumbBmp = createSmoothThumbnail(screenBmp, THUMB_SIZE_PX)
 
         // 3. CHUYỂN ĐỔI SANG WEBP VÀ QUALITY 75
         val compressFormat = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
@@ -316,11 +828,31 @@ class VaultViewModel : ViewModel() {
         val screenBaos = ByteArrayOutputStream()
         screenBmp.compress(compressFormat, targetQuality, screenBaos)
 
-        if (baseBmp != screenBmp && !isVideo) baseBmp.recycle()
-        thumbBmp.recycle()
-        screenBmp.recycle()
+        if (baseBmp != screenBmp && (recycleInputBitmap || baseBmp !== chosenVideoFrame)) {
+            baseBmp.recycle()
+        }
+        if (thumbBmp != screenBmp) thumbBmp.recycle()
+        if (screenBmp !== chosenVideoFrame || recycleInputBitmap) {
+            screenBmp.recycle()
+        }
 
-        return Pair(thumbBaos.toByteArray(), screenBaos.toByteArray())
+        return Triple(thumbBaos.toByteArray(), screenBaos.toByteArray(), Pair(origW, origH))
+    }
+
+    private fun getExifRotationDegrees(context: Context, uri: Uri): Int {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                val exif = ExifInterface(inputStream)
+                when (exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                    else -> 0
+                }
+            } ?: 0
+        } catch (e: Exception) {
+            0
+        }
     }
 
     private fun createSmoothThumbnail(source: Bitmap, targetMinEdge: Int): Bitmap {
@@ -364,6 +896,28 @@ class VaultViewModel : ViewModel() {
         }
     }
 
+    fun deleteMultipleMedia(context: Context, itemsToDelete: List<VaultItem>, onFinished: (() -> Unit)? = null) {
+        if (itemsToDelete.isEmpty()) return
+        viewModelScope.launch {
+            _isLoading.value = true
+            _error.value = null
+            try {
+                withContext(Dispatchers.IO) {
+                    itemsToDelete.forEach { item ->
+                        CryptoEngine.deleteFile(context, item.uri)
+                    }
+                }
+                _selectedMedia.value = null
+                loadVaultItems(context)
+                onFinished?.invoke()
+            } catch (e: Exception) {
+                _error.value = "Failed to delete selected files: ${e.message}"
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
     private fun isVideoFile(fileName: String) = fileName.substringAfterLast('.', "").lowercase() in setOf("mp4", "mkv", "webm", "avi", "mov", "3gp", "ts", "m4v")
 
     private fun getFileNameFromUri(context: Context, uri: Uri): String? {
@@ -377,7 +931,6 @@ class VaultViewModel : ViewModel() {
         return name
     }
 
-    /** Lấy kích thước gốc (byte) của file nguồn để tính % tiến độ mã hoá. Trả -1 nếu không xác định được. */
     private fun getFileSizeFromUri(context: Context, uri: Uri): Long {
         var size = -1L
         try {
@@ -398,13 +951,7 @@ class VaultViewModel : ViewModel() {
         return size
     }
 
-    /**
-     * Hàm lấy ngày chụp thực tế đáng tin cậy.
-     * Đọc trực tiếp EXIF Metadata từ luồng file byte để lấy chuẩn xác,
-     * phòng trường hợp DocumentProvider/SAF trả về null.
-     */
     private fun getActualDateTaken(context: Context, uri: Uri, isVideo: Boolean): Long {
-        // 1. Thử lấy từ datetaken của MediaStore (Nhanh nhất)
         try {
             context.contentResolver.query(uri, arrayOf("datetaken"), null, null, null)?.use {
                 if (it.moveToFirst()) {
@@ -417,7 +964,6 @@ class VaultViewModel : ViewModel() {
             }
         } catch (e: Exception) {}
 
-        // 2. Mở file stream đọc trực tiếp Metadata bên trong để lấy chuẩn ngày
         try {
             if (isVideo) {
                 val retriever = MediaMetadataRetriever()
@@ -461,7 +1007,6 @@ class VaultViewModel : ViewModel() {
             e.printStackTrace()
         }
 
-        // 3. Fallback check ngày sửa đổi file gần nhất từ Provider
         try {
             context.contentResolver.query(uri, arrayOf("date_modified"), null, null, null)?.use {
                 if (it.moveToFirst()) {
@@ -474,7 +1019,6 @@ class VaultViewModel : ViewModel() {
             }
         } catch (e: Exception) {}
 
-        // 4. Nếu toàn bộ metadata bị mất/hỏng, buộc phải dùng ngày hiện tại
         return System.currentTimeMillis()
     }
 
