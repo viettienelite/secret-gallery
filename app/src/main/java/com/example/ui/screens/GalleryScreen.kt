@@ -12,9 +12,14 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -67,6 +72,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.MotionPhotosOn
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -104,8 +110,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathMeasure
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -119,6 +129,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -202,6 +213,129 @@ private fun findMediaItemIndexAtPosition(
     return closestIdx
 }
 
+/**
+ * Đường viền tiến độ hình vuông bo góc (Square Progress Indicator) bao sát quanh ô thumbnail vuông.
+ * Bắt đầu từ chính giữa cạnh trên (12 giờ) và chạy thuận chiều kim đồng hồ quanh 4 cạnh hình vuông.
+ */
+@Composable
+private fun SquareProgressBox(
+    progress: Float,
+    isIndeterminate: Boolean,
+    activeColor: Color,
+    trackColor: Color,
+    boxSize: Dp,
+    strokeWidth: Dp = 3.5.dp,
+    cornerRadius: Dp = 10.dp,
+    content: @Composable () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "square_indeterminate")
+    val indeterminatePhase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1200, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "square_phase"
+    )
+
+    Box(
+        modifier = Modifier.size(boxSize),
+        contentAlignment = Alignment.Center
+    ) {
+        content()
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokePx = strokeWidth.toPx()
+            val halfStroke = strokePx / 2f
+            val r = cornerRadius.toPx().coerceAtMost((size.width - strokePx) / 2f)
+
+            val left = halfStroke
+            val top = halfStroke
+            val right = size.width - halfStroke
+            val bottom = size.height - halfStroke
+            val midTopX = (left + right) / 2f
+
+            // Xây dựng đường Path khép kín quanh hình vuông bo góc bắt đầu từ điểm giữa cạnh trên (12h)
+            val fullSquarePath = Path().apply {
+                moveTo(midTopX, top)
+                lineTo(right - r, top)
+                arcTo(
+                    rect = Rect(right - 2 * r, top, right, top + 2 * r),
+                    startAngleDegrees = -90f,
+                    sweepAngleDegrees = 90f,
+                    forceMoveTo = false
+                )
+                lineTo(right, bottom - r)
+                arcTo(
+                    rect = Rect(right - 2 * r, bottom - 2 * r, right, bottom),
+                    startAngleDegrees = 0f,
+                    sweepAngleDegrees = 90f,
+                    forceMoveTo = false
+                )
+                lineTo(left + r, bottom)
+                arcTo(
+                    rect = Rect(left, bottom - 2 * r, left + 2 * r, bottom),
+                    startAngleDegrees = 90f,
+                    sweepAngleDegrees = 90f,
+                    forceMoveTo = false
+                )
+                lineTo(left, top + r)
+                arcTo(
+                    rect = Rect(left, top, left + 2 * r, top + 2 * r),
+                    startAngleDegrees = 180f,
+                    sweepAngleDegrees = 90f,
+                    forceMoveTo = false
+                )
+                lineTo(midTopX, top)
+            }
+
+            // Vẽ đường nền (track) bao quanh hình vuông
+            drawPath(
+                path = fullSquarePath,
+                color = trackColor,
+                style = Stroke(width = strokePx, cap = StrokeCap.Round)
+            )
+
+            val pathMeasure = PathMeasure()
+            pathMeasure.setPath(fullSquarePath, false)
+            val totalLen = pathMeasure.length
+
+            if (totalLen > 0f) {
+                val segmentPath = Path()
+                if (isIndeterminate) {
+                    val segLen = totalLen * 0.28f
+                    val startDist = indeterminatePhase * totalLen
+                    val endDist = startDist + segLen
+                    if (endDist <= totalLen) {
+                        pathMeasure.getSegment(startDist, endDist, segmentPath, true)
+                    } else {
+                        pathMeasure.getSegment(startDist, totalLen, segmentPath, true)
+                        pathMeasure.getSegment(0f, endDist - totalLen, segmentPath, true)
+                    }
+                } else {
+                    val stopDist = (progress.coerceIn(0f, 1f)) * totalLen
+                    if (stopDist > 0.5f) {
+                        pathMeasure.getSegment(0f, stopDist, segmentPath, true)
+                    }
+                }
+
+                drawPath(
+                    path = segmentPath,
+                    color = activeColor,
+                    style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                )
+            }
+        }
+    }
+}
+
+private data class EncryptingThumbState(
+    val bitmap: Bitmap?,
+    val isVideo: Boolean,
+    val isLivePhoto: Boolean
+)
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun GalleryScreen(
@@ -220,10 +354,18 @@ fun GalleryScreen(
     val importQueueIndex by viewModel.importQueueIndex.collectAsState()
     val currentImportThumb by viewModel.currentImportThumb.collectAsState()
     val currentImportIsVideo by viewModel.currentImportIsVideo.collectAsState()
+    val currentImportIsLivePhoto by viewModel.currentImportIsLivePhoto.collectAsState()
     val isCancellingImport by viewModel.isCancellingImport.collectAsState()
     val videoFramePickRequest by viewModel.videoFramePickRequest.collectAsState()
     val error by viewModel.error.collectAsState()
     val animatingItem by viewModel.animatingItem.collectAsState()
+
+    // Làm mượt phần trăm tiến độ mã hoá (chạy mượt cả đường viền vuông lẫn con số %)
+    val smoothImportProgress by animateFloatAsState(
+        targetValue = importProgress.coerceIn(0f, 1f),
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "smooth_import_progress"
+    )
 
     var isSelectionMode by remember { mutableStateOf(false) }
     var selectedEncryptedNames by remember { mutableStateOf<Set<String>>(emptySet()) }
@@ -779,10 +921,7 @@ fun GalleryScreen(
                                     groupKeys.isNotEmpty() && selectedEncryptedNames.containsAll(groupKeys)
                                 }
 
-                                // FIX LAYOUT SHIFT KHI BẬT/TẮT CHẾ ĐỘ SELECT:
-                                // Cố định chiều cao của dòng Header (height = 24.dp bên trong vùng padding cố định)
-                                // để khi nút "Select day" (cao 20.dp) hiện ra hoặc ẩn đi thì tổng chiều cao dòng
-                                // vẫn giữ nguyên tuyệt đối, không đẩy lưới ảnh dịch xuống.
+                                // Cố định chiều cao 24.dp cho dòng tiêu đề ngày để không bị layout shift khi hiện nút Select day
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -980,14 +1119,15 @@ fun GalleryScreen(
                 }
             }
 
-            // Loading / Encryption Progress Overlay với Preview Thumbnail 216x216 px nằm gọn trong vòng tròn tiến trình
+            // Loading / Encryption Progress Overlay với tiến độ bao quanh hình vuông + ảnh thumb fade-in / fade-out
             AnimatedVisibility(
                 visible = isLoading && videoFramePickRequest == null,
                 enter = fadeIn(animationSpec = tween(200)),
                 exit = fadeOut(animationSpec = tween(150))
             ) {
                 val realThumbSizeDp = with(density) { VaultViewModel.THUMB_SIZE_PX.toDp() }
-                val progressRingSizeDp = realThumbSizeDp * 1.52f
+                // Khung viền tiến độ hình vuông bao sát quanh ô thumb 216x216 px (cách 6.dp mỗi cạnh)
+                val squareProgressBoxSizeDp = realThumbSizeDp + 12.dp
 
                 Box(
                     modifier = Modifier
@@ -1016,74 +1156,66 @@ fun GalleryScreen(
                                 .widthIn(min = 240.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Box(
-                                modifier = Modifier.size(progressRingSizeDp),
-                                contentAlignment = Alignment.Center
+                            // Đường tiến độ bao quanh hình vuông
+                            SquareProgressBox(
+                                progress = smoothImportProgress,
+                                isIndeterminate = importProgress <= 0f || isCancellingImport,
+                                activeColor = if (isCancellingImport) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                                trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                                boxSize = squareProgressBoxSizeDp,
+                                strokeWidth = 3.5.dp,
+                                cornerRadius = 10.dp
                             ) {
-                                if (importProgress > 0f && !isCancellingImport) {
-                                    CircularProgressIndicator(
-                                        progress = { importProgress },
-                                        modifier = Modifier.fillMaxSize(),
-                                        color = MaterialTheme.colorScheme.primary,
-                                        trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                                        strokeWidth = 4.5.dp
-                                    )
-                                } else {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.fillMaxSize(),
-                                        color = if (isCancellingImport) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                                        strokeWidth = 4.5.dp
-                                    )
-                                }
-
-                                // Hình vuông Preview Thumbnail kích thước thật (216 x 216 px) nằm bên trong vòng tròn
-                                val thumbBmp = currentImportThumb
-                                if (thumbBmp != null) {
+                                // Hiệu ứng Fade In / Fade Out mượt mà khi đổi ảnh thumb của từng file đang mã hoá
+                                val thumbState = EncryptingThumbState(
+                                    bitmap = currentImportThumb,
+                                    isVideo = currentImportIsVideo,
+                                    isLivePhoto = currentImportIsLivePhoto
+                                )
+                                AnimatedContent(
+                                    targetState = thumbState,
+                                    transitionSpec = {
+                                        fadeIn(animationSpec = tween(260, easing = FastOutSlowInEasing))
+                                            .togetherWith(fadeOut(animationSpec = tween(220, easing = FastOutSlowInEasing)))
+                                    },
+                                    contentKey = { it.bitmap },
+                                    label = "encrypting_thumb_fade"
+                                ) { state ->
                                     Box(
                                         modifier = Modifier
                                             .size(realThumbSizeDp)
-                                            .clip(RoundedCornerShape(6.dp))
-                                            .background(Color.Black)
-                                            .border(
-                                                width = 1.dp,
-                                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
-                                                shape = RoundedCornerShape(6.dp)
-                                            ),
+                                            .clip(RoundedCornerShape(7.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
                                         contentAlignment = Alignment.Center
                                     ) {
-                                        Image(
-                                            bitmap = thumbBmp.asImageBitmap(),
-                                            contentDescription = "Encrypting Thumbnail Preview",
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
-                                        )
+                                        if (state.bitmap != null) {
+                                            Image(
+                                                bitmap = state.bitmap.asImageBitmap(),
+                                                contentDescription = "Encrypting Thumbnail Preview",
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
 
-                                        // Giữ icon video ở góc dưới bên phải của preview thumb khi đang mã hoá video
-                                        if (currentImportIsVideo) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .align(Alignment.BottomEnd)
-                                                    .padding(4.dp)
-                                                    .clip(RoundedCornerShape(4.dp))
-                                                    .background(Color.Black.copy(alpha = 0.65f))
-                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Filled.PlayArrow,
-                                                    contentDescription = "Video file",
-                                                    tint = Color.White,
-                                                    modifier = Modifier.size(10.dp)
-                                                )
+                                            // Giữ icon video hoặc Live Photo ở góc dưới bên phải của preview thumb khi đang mã hoá
+                                            if (state.isVideo || state.isLivePhoto) {
+                                                Box(
+                                                    modifier = Modifier
+                                                        .align(Alignment.BottomEnd)
+                                                        .padding(4.dp)
+                                                        .clip(RoundedCornerShape(4.dp))
+                                                        .background(Color.Black.copy(alpha = 0.65f))
+                                                        .padding(horizontal = 4.dp, vertical = 2.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = if (state.isVideo) Icons.Filled.PlayArrow else Icons.Filled.MotionPhotosOn,
+                                                        contentDescription = if (state.isVideo) "Video file" else "Live Photo",
+                                                        tint = Color.White,
+                                                        modifier = Modifier.size(10.dp)
+                                                    )
+                                                }
                                             }
                                         }
                                     }
-                                } else if (importProgress > 0f) {
-                                    Text(
-                                        text = "${(importProgress * 100).toInt()}%",
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
                                 }
                             }
 
@@ -1091,7 +1223,7 @@ fun GalleryScreen(
 
                             if (importProgress > 0f && !isCancellingImport) {
                                 Text(
-                                    text = "${(importProgress * 100).toInt()}%",
+                                    text = "${(smoothImportProgress * 100).toInt()}%",
                                     fontSize = 15.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.primary
@@ -1121,7 +1253,6 @@ fun GalleryScreen(
                                 )
                             }
 
-                            // Nút CANCEL IMPORT trong lúc đang mã hoá / chuẩn bị import
                             if (importQueueTotal > 0) {
                                 Spacer(modifier = Modifier.height(16.dp))
                                 OutlinedButton(
@@ -1180,7 +1311,6 @@ fun VideoFramePickerDialog(
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    // Kích thước thật của 1 ô thumbnail trên lưới: hình vuông 216 x 216 px
     val realThumbSizeDp = with(density) { VaultViewModel.THUMB_SIZE_PX.toDp() }
 
     var durationMs by remember(request.uri, request.queueIndex) { mutableLongStateOf(0L) }
@@ -1320,7 +1450,6 @@ fun VideoFramePickerDialog(
                         )
                     }
                     Spacer(modifier = Modifier.width(8.dp))
-                    // Chip tiến độ số video đã chọn thumb với cỡ chữ nhỏ gọn
                     Text(
                         text = "${request.queueIndex} / ${request.queueTotal}",
                         fontSize = 10.sp,
@@ -1335,7 +1464,6 @@ fun VideoFramePickerDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Khung video mở rộng tối đa chiều cao (weight 1f) và hoàn toàn cố định nhờ thanh filmstrip bên dưới luôn giữ nguyên chiều cao
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1422,13 +1550,18 @@ fun VideoFramePickerDialog(
                         )
                     }
 
-                    // PREVIEW THUMBNAIL KÍCH THƯỚC THẬT (Hình vuông 216 x 216 px) Ở GÓC TRÊN BÊN PHẢI
-                    // (Đã bỏ icon video góc dưới phải và bỏ chữ 216x216 px)
-                    if (bmp != null) {
+                    // PREVIEW THUMBNAIL KÍCH THƯỚC THẬT (Hình vuông 216 x 216 px) Ở GÓC TRÊN BÊN PHẢI VỚI FADE IN / OUT
+                    // Dùng tên đầy đủ androidx.compose.animation.AnimatedVisibility để tránh xung đột với ColumnScope của Column bên ngoài
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = bmp != null,
+                        enter = fadeIn(tween(220)),
+                        exit = fadeOut(tween(180)),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                    ) {
                         Box(
                             modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(8.dp)
                                 .size(realThumbSizeDp)
                                 .clip(RoundedCornerShape(6.dp))
                                 .background(Color.Black)
@@ -1438,12 +1571,14 @@ fun VideoFramePickerDialog(
                                     shape = RoundedCornerShape(6.dp)
                                 )
                         ) {
-                            Image(
-                                bitmap = bmp.asImageBitmap(),
-                                contentDescription = "Actual 1:1 Thumbnail Preview",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
+                            bmp?.let { previewBmp ->
+                                Image(
+                                    bitmap = previewBmp.asImageBitmap(),
+                                    contentDescription = "Actual 1:1 Thumbnail Preview",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
                         }
                     }
 
@@ -1466,9 +1601,7 @@ fun VideoFramePickerDialog(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // THANH TUA THỜI GIAN GỘP CHUNG VỚI BAR THUMB HORIZONTAL (FILMSTRIP SCRUBBER):
-                // Luôn giữ chiều cao cố định 48.dp ngay từ đầu (kể cả khi filmstripBitmaps đang tải)
-                // để khung video phía trên không bao giờ bị giật/thay đổi chiều cao.
+                // THANH TUA THỜI GIAN GỘP CHUNG VỚI BAR THUMB HORIZONTAL (FILMSTRIP SCRUBBER)
                 val currentDurationMs by rememberUpdatedState(durationMs)
                 Box(
                     modifier = Modifier
@@ -1499,7 +1632,12 @@ fun VideoFramePickerDialog(
                         }
                         .testTag("video_thumb_slider")
                 ) {
-                    if (filmstripBitmaps.isNotEmpty()) {
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = filmstripBitmaps.isNotEmpty(),
+                        enter = fadeIn(tween(220)),
+                        exit = fadeOut(tween(150)),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
                         Row(modifier = Modifier.fillMaxSize()) {
                             filmstripBitmaps.forEach { stripBmp ->
                                 Image(
@@ -1514,20 +1652,17 @@ fun VideoFramePickerDialog(
                         }
                     }
 
-                    // Vạch chỉ thời gian (Playhead) trượt mượt trực tiếp trên dải thumbnail ngang
                     Canvas(modifier = Modifier.fillMaxSize()) {
                         val dur = durationMs.toFloat().coerceAtLeast(1f)
                         val fraction = (selectedPositionMs / dur).coerceIn(0f, 1f)
                         val playheadX = (fraction * size.width).coerceIn(3.dp.toPx(), size.width - 3.dp.toPx())
 
-                        // Lớp phủ tối nhẹ cho phần thời gian đã đi qua
                         drawRect(
                             color = Color.Black.copy(alpha = 0.22f),
                             topLeft = Offset.Zero,
                             size = ComposeSize(playheadX, size.height)
                         )
 
-                        // Đổ bóng đen nhẹ sau thanh kéo để nổi bật trên mọi nền video
                         drawRoundRect(
                             color = Color.Black.copy(alpha = 0.65f),
                             topLeft = Offset(playheadX - 3.5.dp.toPx(), 0f),
@@ -1535,7 +1670,6 @@ fun VideoFramePickerDialog(
                             cornerRadius = CornerRadius(3.5.dp.toPx(), 3.5.dp.toPx())
                         )
 
-                        // Thanh kim chỉ vị trí (Playhead) màu vàng kim chủ đạo
                         drawRoundRect(
                             color = goldColor,
                             topLeft = Offset(playheadX - 2.dp.toPx(), 1.5.dp.toPx()),
@@ -1567,7 +1701,6 @@ fun VideoFramePickerDialog(
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                // Hàng nút hành động dưới cùng: CANCEL + USE THIS FRAME
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1776,7 +1909,11 @@ fun GalleryGridItem(
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
-                        imageVector = if (item.isVideo) Icons.Filled.Videocam else Icons.Filled.Image,
+                        imageVector = when {
+                            item.isVideo -> Icons.Filled.Videocam
+                            item.isLivePhoto -> Icons.Filled.MotionPhotosOn
+                            else -> Icons.Filled.Image
+                        },
                         contentDescription = "Placeholder",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
                         modifier = Modifier.size(22.dp)
@@ -1796,7 +1933,8 @@ fun GalleryGridItem(
             }
         }
 
-        if (item.isVideo) {
+        // Nhãn báo Video hoặc Live Photo ở góc dưới
+        if (item.isVideo || item.isLivePhoto) {
             Box(
                 modifier = Modifier
                     .align(if (isSelectionMode) Alignment.BottomStart else Alignment.BottomEnd)
@@ -1806,8 +1944,8 @@ fun GalleryGridItem(
                     .padding(horizontal = 4.dp, vertical = 2.dp)
             ) {
                 Icon(
-                    imageVector = Icons.Filled.PlayArrow,
-                    contentDescription = "Video file",
+                    imageVector = if (item.isVideo) Icons.Filled.PlayArrow else Icons.Filled.MotionPhotosOn,
+                    contentDescription = if (item.isVideo) "Video file" else "Live Photo",
                     tint = Color.White,
                     modifier = Modifier.size(10.dp)
                 )

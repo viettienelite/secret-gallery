@@ -37,6 +37,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -529,31 +530,56 @@ fun WelcomeScreen(
                             modifier = Modifier.padding(24.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                            // Hàng đầu tiên: Nút mũi tên Back ở góc trên bên trái + Nhãn tên thư mục ở chính giữa
+                            Box(
+                                modifier = Modifier.fillMaxWidth()
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Folder,
-                                    contentDescription = "Folder",
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = folderName,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                IconButton(
+                                    onClick = { viewModel.setVaultUri(context, null) },
+                                    enabled = !isLoading,
+                                    modifier = Modifier
+                                        .align(Alignment.CenterStart)
+                                        .size(36.dp)
+                                        .clip(CircleShape)
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                                        .testTag("change_folder_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                        contentDescription = "Back to saved vaults",
+                                        tint = MaterialTheme.colorScheme.onSurface,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .align(Alignment.Center)
+                                        .padding(horizontal = 44.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Folder,
+                                        contentDescription = "Folder",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = folderName,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
 
-                            Spacer(modifier = Modifier.height(20.dp))
+                            Spacer(modifier = Modifier.height(18.dp))
 
                             Text(
                                 text = if (isVaultConfigured) "Unlock Your Vault" else "Initialize New Vault",
@@ -742,28 +768,6 @@ fun WelcomeScreen(
                                             maxLines = 1
                                         )
                                     }
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            TextButton(
-                                onClick = { viewModel.setVaultUri(context, null) },
-                                enabled = !isLoading,
-                                modifier = Modifier.testTag("change_folder_button")
-                            ) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Filled.SwapHoriz,
-                                        contentDescription = "Switch",
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = if (savedVaults.isNotEmpty()) "Back to saved vaults" else "Choose another folder",
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
                                 }
                             }
                         }

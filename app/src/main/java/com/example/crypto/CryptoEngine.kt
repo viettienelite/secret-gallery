@@ -6,7 +6,6 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.util.Base64
 import java.io.ByteArrayInputStream
-import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -28,21 +27,26 @@ object CryptoEngine {
     private const val TAG_SIZE_BYTES = 16
     private const val ENCRYPTED_BLOCK_SIZE = BLOCK_SIZE + TAG_SIZE_BYTES // 4112 bytes
 
+    private const val FLAG_HAS_DIMENSIONS = 1
+    private const val FLAG_IS_LIVE_PHOTO = 2
+
     val SGV2_MAGIC = "SGV2".toByteArray(Charsets.UTF_8)
 
     enum class Tier { THUMB, SCREEN, FULL }
 
     /**
      * Thông tin metadata đọc trực tiếp O(1) từ 96-byte Header của SGV2,
-     * giúp hiển thị File Properties tức thì mà không cần giải mã tầng FULL hay tạo file tạm.
+     * bao gồm cả thông tin Live Photo (vị trí và kích thước video nhúng trong Tier FULL).
      */
     data class Sgv2FileInfo(
         val width: Int,
         val height: Int,
-        val decryptedSize: Long
+        val decryptedSize: Long,
+        val isLivePhoto: Boolean = false,
+        val liveVideoOffset: Long = 0L,
+        val liveVideoSize: Long = 0L
     )
 
-    // --- Giữ nguyên các hàm deriveKek, initVault, unlockVault, hasVaultConfig, calculateBlockIv ---
     fun deriveKek(password: String, salt: ByteArray): SecretKeySpec {
         val spec = PBEKeySpec(password.toCharArray(), salt, ITERATIONS, KEY_LENGTH)
         val factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM)
@@ -97,7 +101,6 @@ object CryptoEngine {
         return findChildUri(context, directoryUri, "vault.conf") != null
     }
 
-    // Tên file chỉ còn 1 tier mã hóa, không lưu thumb_enc riêng nữa
     fun encryptFileName(name: String, dek: ByteArray): String {
         val random = SecureRandom()
         val iv = ByteArray(12).apply { random.nextBytes(this) }
@@ -139,14 +142,12 @@ object CryptoEngine {
         return fullBlocks * BLOCK_SIZE + remainingPlaintext
     }
 
-    // --- CÁC HÀM XỬ LÝ FORMAT SGV2 MỚI ---
-
     private fun encryptBlob(data: ByteArray, dek: ByteArray): ByteArray {
         val nonce = ByteArray(12).apply { SecureRandom().nextBytes(this) }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, nonce))
         val ciphertext = cipher.doFinal(data)
-        return nonce + ciphertext // Tự chứa Nonce + Payload + Tag
+        return nonce + ciphertext
     }
 
     private fun decryptBlob(blob: ByteArray, dek: ByteArray): ByteArray {
@@ -158,10 +159,10 @@ object CryptoEngine {
     }
 
     /**
-     * Tạo file SGV2 chứa cả 3 Tier. Tier Full được đọc trực tiếp từ InputStream để
-     * bảo toàn 100% EXIF/Gainmap của file gốc mà không qua decode.
-     * Tận dụng các byte dự phòng trong 64-byte plaintext header để lưu luôn mediaWidth,
-     * mediaHeight và sourceSize (giữ nguyên kích thước 96-byte Fixed Header).
+     * Tạo file SGV2 chứa cả 3 Tier. Hỗ trợ đầy đủ cả ảnh tĩnh, video và Live Photo / Motion Photo:
+     * - Với Motion Photo nhúng sẵn trong 1 file (Google/Samsung/Xiaomi/OPPO): lưu liveVideoOffset và liveVideoSize.
+     * - Với Live Photo dạng cặp 2 file (ảnh + companionVideoUri .mov/.mp4): nối luồng byte của companionVideoUri
+     *   ngay sau luồng ảnh gốc trong Tier FULL để gói gọn thành 1 file SGV2 duy nhất.
      */
     fun encryptSgv2File(
         context: Context,
@@ -173,56 +174,78 @@ object CryptoEngine {
         sourceSize: Long = -1L,
         mediaWidth: Int = 0,
         mediaHeight: Int = 0,
+        liveVideoOffset: Long = 0L,
+        liveVideoSize: Long = 0L,
+        companionVideoUri: Uri? = null,
+        companionVideoSize: Long = 0L,
         onProgress: ((Float) -> Unit)? = null
     ) {
         val thumbCipher = encryptBlob(thumbBytes, dek)
         val screenCipher = encryptBlob(screenBytes, dek)
 
+        val hasDimensions = mediaWidth > 0 && mediaHeight > 0
+        val isLivePhoto = (liveVideoOffset > 0L && liveVideoSize > 0L) || (companionVideoUri != null && companionVideoSize > 0L)
+        val effectiveLiveOffset = if (companionVideoUri != null && sourceSize > 0L) sourceSize else liveVideoOffset
+        val effectiveLiveSize = if (companionVideoUri != null && companionVideoSize > 0L) companionVideoSize else liveVideoSize
+        val totalPlainSize = when {
+            companionVideoUri != null && sourceSize > 0L && companionVideoSize > 0L -> sourceSize + companionVideoSize
+            sourceSize > 0L -> sourceSize
+            else -> -1L
+        }
+
+        var flags = 0
+        if (hasDimensions) flags = flags or FLAG_HAS_DIMENSIONS
+        if (isLivePhoto) flags = flags or FLAG_IS_LIVE_PHOTO
+
         // Tạo plaintext header 64 byte:
         // [0..7]   thumbCipher.size (Long)
         // [8..15]  screenCipher.size (Long)
-        // [16..19] flags (Int: 1 = có lưu metadata kích thước/dung lượng gốc, 0 = mặc định cũ)
+        // [16..19] flags (Int: bit 0 = hasDimensions, bit 1 = isLivePhoto)
         // [20..23] mediaWidth (Int)
         // [24..27] mediaHeight (Int)
-        // [28..35] sourceSize (Long)
-        // [36..63] dự phòng (zero-fill)
-        val hasDimensions = mediaWidth > 0 && mediaHeight > 0
+        // [28..35] sourceSize (Long - kích thước phần ảnh gốc)
+        // [36..43] effectiveLiveOffset (Long - vị trí bắt đầu MP4/MOV trong Tier FULL)
+        // [44..51] effectiveLiveSize (Long - độ dài byte của MP4/MOV trong Tier FULL)
+        // [52..63] dự phòng (zero-fill)
         val headerPlain = ByteBuffer.allocate(64).apply {
             putLong(thumbCipher.size.toLong())
             putLong(screenCipher.size.toLong())
-            putInt(if (hasDimensions) 1 else 0)
+            putInt(flags)
             putInt(if (hasDimensions) mediaWidth else 0)
             putInt(if (hasDimensions) mediaHeight else 0)
             putLong(if (sourceSize > 0L) sourceSize else 0L)
-            // Phần còn lại tự động zero-fill
+            putLong(if (isLivePhoto) effectiveLiveOffset else 0L)
+            putLong(if (isLivePhoto) effectiveLiveSize else 0L)
         }.array()
 
         val headerNonce = ByteArray(12).apply { SecureRandom().nextBytes(this) }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, headerNonce))
-        val headerCiphertext = cipher.doFinal(headerPlain) // Sẽ dài 80 bytes
+        val headerCiphertext = cipher.doFinal(headerPlain)
 
         context.contentResolver.openOutputStream(destUri)?.use { out ->
-            // Ghi 96 bytes Fixed Header
-            out.write(SGV2_MAGIC) // 4 bytes
-            out.write(headerNonce) // 12 bytes
-            out.write(headerCiphertext) // 80 bytes
+            out.write(SGV2_MAGIC)
+            out.write(headerNonce)
+            out.write(headerCiphertext)
 
-            // Ghi các tier metadata
             out.write(thumbCipher)
             out.write(screenCipher)
 
-            // Block-encrypt file Full trực tiếp để giữ EXIF
-            context.contentResolver.openInputStream(sourceUri)?.use { input ->
-                encryptFileContent(input, out, dek, sourceSize, onProgress)
+            context.contentResolver.openInputStream(sourceUri)?.use { primaryInput ->
+                if (companionVideoUri != null) {
+                    context.contentResolver.openInputStream(companionVideoUri)?.use { companionInput ->
+                        val combinedInput = java.io.SequenceInputStream(primaryInput, companionInput)
+                        encryptFileContent(combinedInput, out, dek, totalPlainSize, onProgress)
+                    } ?: encryptFileContent(primaryInput, out, dek, totalPlainSize, onProgress)
+                } else {
+                    encryptFileContent(primaryInput, out, dek, totalPlainSize, onProgress)
+                }
             }
         }
     }
 
     /**
-     * Đọc nhanh thông tin file (width, height, decryptedSize) trong O(1) chỉ từ 96 bytes Header đầu tiên.
-     * Tương thích ngược hoàn toàn với các file SGV2 cũ (trả về width=0, height=0 và decryptedSize tính
-     * chính xác bằng toán học qua getDecryptedLength).
+     * Đọc nhanh thông tin file (width, height, decryptedSize, thông tin Live Photo) trong O(1) từ 96 bytes Header.
      */
     fun readSgv2FileInfo(context: Context, uri: Uri, dek: ByteArray): Sgv2FileInfo? {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
@@ -258,6 +281,8 @@ object CryptoEngine {
                 val width = headerPlain.int
                 val height = headerPlain.int
                 val storedOriginalSize = headerPlain.long
+                val liveOffset = headerPlain.long
+                val liveSize = headerPlain.long
 
                 val offsetFull = 96L + thumbLen + screenLen
                 val fullTierEncryptedSize = (totalFileSize - offsetFull).coerceAtLeast(0L)
@@ -267,10 +292,16 @@ object CryptoEngine {
                     getDecryptedLength(fullTierEncryptedSize)
                 }
 
+                val hasDim = (flags and FLAG_HAS_DIMENSIONS) != 0
+                val isLive = ((flags and FLAG_IS_LIVE_PHOTO) != 0) && liveOffset > 0L && liveSize > 0L
+
                 Sgv2FileInfo(
-                    width = if (flags != 0 && width > 0) width else 0,
-                    height = if (flags != 0 && height > 0) height else 0,
-                    decryptedSize = realSize
+                    width = if (hasDim && width > 0) width else 0,
+                    height = if (hasDim && height > 0) height else 0,
+                    decryptedSize = realSize,
+                    isLivePhoto = isLive,
+                    liveVideoOffset = if (isLive) liveOffset else 0L,
+                    liveVideoSize = if (isLive) liveSize else 0L
                 )
             }
         } catch (e: Exception) {
@@ -278,7 +309,10 @@ object CryptoEngine {
         }
     }
 
-    /** Block encryption gốc cho Tier 3. totalSize/onProgress dùng để báo % tiến độ khi import. */
+    /**
+     * Block encryption cho Tier 3.
+     * Báo tiến độ mịn theo từng nấc 0.2% (500 bước) để thanh tiến trình trên UI chạy mượt mà.
+     */
     private fun encryptFileContent(
         input: InputStream,
         output: OutputStream,
@@ -295,7 +329,7 @@ object CryptoEngine {
         var blockIndex = 0L
         var bytesRead: Int
         var totalBytesRead = 0L
-        var lastReportedPercent = -1
+        var lastReportedStep = -1
 
         while (input.read(buffer).also { bytesRead = it } != -1) {
             val blockIv = calculateBlockIv(fileNonce, blockIndex)
@@ -304,12 +338,11 @@ object CryptoEngine {
             blockIndex++
             totalBytesRead += bytesRead
 
-            // Chỉ báo tiến độ khi biết tổng kích thước, và chỉ khi % nguyên thay đổi (tránh spam state)
             if (totalSize > 0 && onProgress != null) {
                 val progress = (totalBytesRead.toFloat() / totalSize.toFloat()).coerceIn(0f, 1f)
-                val percent = (progress * 100).toInt()
-                if (percent != lastReportedPercent) {
-                    lastReportedPercent = percent
+                val step = (progress * 500).toInt() // Cập nhật mỗi 0.2%
+                if (step != lastReportedStep) {
+                    lastReportedStep = step
                     onProgress(progress)
                 }
             }
@@ -326,18 +359,12 @@ object CryptoEngine {
         }
     }
 
-    /**
-     * Đọc O(1) Seek bất kỳ tier nào. Trả về luồng InputStream đã được giải mã sẵn.
-     */
     fun getSgv2TierStream(context: Context, uri: Uri, tier: Tier, dek: ByteArray): InputStream? {
         val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
-        // Dùng AutoCloseInputStream để khi đóng fis (hoặc BlockDecryptingInputStream ở Tier.FULL)
-        // thì pfd cũng được tự động đóng theo, tránh rò rỉ FileDescriptor.
         val fis = ParcelFileDescriptor.AutoCloseInputStream(pfd)
         return try {
             val channel = fis.channel
 
-            // Đọc đủ 96 bytes Header
             val headerBuffer = ByteBuffer.allocate(96)
             while (headerBuffer.hasRemaining()) {
                 if (channel.read(headerBuffer) == -1) break
@@ -388,7 +415,6 @@ object CryptoEngine {
                 }
                 Tier.FULL -> {
                     channel.position(offsetFull)
-                    // BlockDecryptingInputStream sẽ đóng fis (và tự đóng luôn pfd nhờ AutoCloseInputStream)
                     BlockDecryptingInputStream(fis, dek)
                 }
             }
@@ -398,7 +424,6 @@ object CryptoEngine {
         }
     }
 
-    // --- Các hàm SAF helper giữ nguyên ---
     private fun getSafeDocumentId(uri: Uri) = if (DocumentsContract.isTreeUri(uri)) DocumentsContract.getTreeDocumentId(uri) else DocumentsContract.getDocumentId(uri)
     fun findChildUri(context: Context, rootUri: Uri, displayName: String): Uri? {
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(rootUri, getSafeDocumentId(rootUri))

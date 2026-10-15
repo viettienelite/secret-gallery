@@ -31,6 +31,9 @@ class EncryptedDataSource(
     private var fullTierEncryptedSize: Long = 0
     private var offsetFull: Long = 0
 
+    // Hỗ trợ ánh xạ phân đoạn video nhúng bên trong Live Photo (?live=1)
+    private var virtualBaseOffset: Long = 0
+
     private var cachedBlockIndex: Long = -1
     private var cachedBlockData: ByteArray? = null
 
@@ -38,6 +41,7 @@ class EncryptedDataSource(
         transferInitializing(dataSpec)
         this.dataSpec = dataSpec
         val uri = dataSpec.uri
+        val isLivePhotoVideo = uri.getQueryParameter("live") == "1"
 
         pfd = context.contentResolver.openFileDescriptor(uri, "r")
             ?: throw IOException("Failed to open file descriptor")
@@ -47,7 +51,7 @@ class EncryptedDataSource(
 
         if (totalFileSize < 96) throw IOException("File too small to be SGV2")
 
-        // Parse SGV2 Header to find Tier 3 (Full) Offset
+        // Parse SGV2 Header to find Tier 3 (Full) Offset & Live Photo slice
         val headerBuffer = ByteBuffer.allocate(96)
         fileChannel!!.read(headerBuffer, 0)
         headerBuffer.flip()
@@ -66,8 +70,14 @@ class EncryptedDataSource(
         val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
         val thumbLen = headerPlain.long
         val screenLen = headerPlain.long
-        offsetFull = 96L + thumbLen + screenLen
+        headerPlain.int // flags
+        headerPlain.int // width
+        headerPlain.int // height
+        headerPlain.long // storedOriginalSize
+        val liveVideoOffset = headerPlain.long
+        val liveVideoSize = headerPlain.long
 
+        offsetFull = 96L + thumbLen + screenLen
         fullTierEncryptedSize = totalFileSize - offsetFull
 
         // Đọc Nonce của Tier 3 tại offsetFull
@@ -79,13 +89,22 @@ class EncryptedDataSource(
         cachedBlockIndex = -1
         cachedBlockData = null
 
-        currentPosition = dataSpec.position
-        val decryptedLength = CryptoEngine.getDecryptedLength(fullTierEncryptedSize)
+        val totalDecryptedLength = CryptoEngine.getDecryptedLength(fullTierEncryptedSize)
 
+        val streamLength: Long
+        if (isLivePhotoVideo && liveVideoOffset > 0L && liveVideoSize > 0L && liveVideoOffset < totalDecryptedLength) {
+            virtualBaseOffset = liveVideoOffset
+            streamLength = minOf(liveVideoSize, totalDecryptedLength - liveVideoOffset)
+        } else {
+            virtualBaseOffset = 0L
+            streamLength = totalDecryptedLength
+        }
+
+        currentPosition = dataSpec.position
         bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
             dataSpec.length
         } else {
-            decryptedLength - currentPosition
+            (streamLength - currentPosition).coerceAtLeast(0L)
         }
 
         opened = true
@@ -98,8 +117,9 @@ class EncryptedDataSource(
         if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
 
         val toRead = minOf(length.toLong(), bytesRemaining).toInt()
-        val blockIndex = currentPosition / 4096
-        val blockOffset = (currentPosition % 4096).toInt()
+        val absolutePlainPosition = virtualBaseOffset + currentPosition
+        val blockIndex = absolutePlainPosition / 4096
+        val blockOffset = (absolutePlainPosition % 4096).toInt()
         val blockRemaining = 4096 - blockOffset
         val bytesFromThisBlock = minOf(toRead, blockRemaining)
 
@@ -121,7 +141,6 @@ class EncryptedDataSource(
     private fun getOrDecryptBlock(blockIndex: Long): ByteArray? {
         if (blockIndex == cachedBlockIndex && cachedBlockData != null) return cachedBlockData
 
-        // Start tính từ offsetFull, bỏ qua 12 byte Nonce của Full tier
         val encryptedBlockStart = offsetFull + 12 + blockIndex * 4112
         if (encryptedBlockStart >= offsetFull + fullTierEncryptedSize) return null
 
@@ -163,6 +182,7 @@ class EncryptedDataSource(
             cachedBlockIndex = -1
             cachedBlockData = null
             dataSpec = null
+            virtualBaseOffset = 0L
         }
     }
 }
