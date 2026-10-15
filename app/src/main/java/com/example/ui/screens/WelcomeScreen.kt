@@ -30,8 +30,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.zIndex
+import com.example.ui.theme.GoogleSansRounded
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -216,7 +221,7 @@ fun WelcomeScreen(
                 text = "SECRET GALLERY",
                 fontSize = 28.sp,
                 fontWeight = FontWeight.ExtraBold,
-                fontFamily = FontFamily.SansSerif,
+                fontFamily = GoogleSansRounded,
                 letterSpacing = 2.sp,
                 color = MaterialTheme.colorScheme.primary,
                 textAlign = TextAlign.Center,
@@ -313,25 +318,69 @@ fun WelcomeScreen(
                                     }
                                 }
 
-                                Spacer(modifier = Modifier.height(6.dp))
+                                Spacer(modifier = Modifier.height(14.dp))
 
-                                Text(
-                                    text = "Tap a remembered vault below to enter its master password, or add another folder.",
-                                    fontSize = 12.sp,
-                                    lineHeight = 17.sp,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-
-                                Spacer(modifier = Modifier.height(16.dp))
+                                val vaultListState = rememberLazyListState()
+                                val currentSavedVaults by rememberUpdatedState(savedVaults)
+                                var draggedVaultKey by remember { mutableStateOf<String?>(null) }
+                                var draggedVaultOffsetY by remember { mutableFloatStateOf(0f) }
 
                                 LazyColumn(
+                                    state = vaultListState,
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .heightIn(max = 260.dp),
+                                        .heightIn(max = 260.dp)
+                                        .pointerInput(Unit) {
+                                            detectDragGesturesAfterLongPress(
+                                                onDragStart = { offset ->
+                                                    val hitItem = vaultListState.layoutInfo.visibleItemsInfo.firstOrNull { info ->
+                                                        offset.y.toInt() in info.offset..(info.offset + info.size)
+                                                    }
+                                                    if (hitItem != null) {
+                                                        draggedVaultKey = hitItem.key as? String
+                                                        draggedVaultOffsetY = 0f
+                                                    }
+                                                },
+                                                onDrag = { change, dragAmount ->
+                                                    val activeKey = draggedVaultKey ?: return@detectDragGesturesAfterLongPress
+                                                    change.consume()
+                                                    draggedVaultOffsetY += dragAmount.y
+
+                                                    val visibleItems = vaultListState.layoutInfo.visibleItemsInfo
+                                                    val currentInfo = visibleItems.firstOrNull { it.key == activeKey }
+                                                        ?: return@detectDragGesturesAfterLongPress
+                                                    val currentCenterY = currentInfo.offset + currentInfo.size / 2f + draggedVaultOffsetY
+
+                                                    val targetInfo = visibleItems.firstOrNull { info ->
+                                                        info.key != activeKey &&
+                                                                currentCenterY >= info.offset.toFloat() &&
+                                                                currentCenterY <= (info.offset + info.size).toFloat()
+                                                    }
+
+                                                    if (targetInfo != null) {
+                                                        val fromIdx = currentSavedVaults.indexOfFirst { it.toString() == activeKey }
+                                                        val toIdx = currentSavedVaults.indexOfFirst { it.toString() == targetInfo.key }
+                                                        if (fromIdx != -1 && toIdx != -1 && fromIdx != toIdx) {
+                                                            draggedVaultOffsetY += (currentInfo.offset - targetInfo.offset).toFloat()
+                                                            viewModel.moveSavedVault(context, fromIdx, toIdx)
+                                                        }
+                                                    }
+                                                },
+                                                onDragEnd = {
+                                                    draggedVaultKey = null
+                                                    draggedVaultOffsetY = 0f
+                                                },
+                                                onDragCancel = {
+                                                    draggedVaultKey = null
+                                                    draggedVaultOffsetY = 0f
+                                                }
+                                            )
+                                        },
                                     verticalArrangement = Arrangement.spacedBy(10.dp)
                                 ) {
-                                    items(savedVaults, key = { it.toString() }) { uriItem ->
+                                    itemsIndexed(savedVaults, key = { _, it -> it.toString() }) { _, uriItem ->
+                                        val itemKey = uriItem.toString()
+                                        val isDraggingItem = draggedVaultKey == itemKey
                                         val (itemFolderName, itemFolderPath) = remember(uriItem) {
                                             parseVaultDisplayInfo(uriItem)
                                         }
@@ -342,15 +391,24 @@ fun WelcomeScreen(
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
-                                                .animateItem()
+                                                .zIndex(if (isDraggingItem) 1f else 0f)
+                                                .graphicsLayer {
+                                                    translationY = if (isDraggingItem) draggedVaultOffsetY else 0f
+                                                    scaleX = if (isDraggingItem) 1.03f else 1f
+                                                    scaleY = if (isDraggingItem) 1.03f else 1f
+                                                }
+                                                .then(if (isDraggingItem) Modifier else Modifier.animateItem())
                                                 .clip(RoundedCornerShape(12.dp))
-                                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))
+                                                .background(
+                                                    if (isDraggingItem) MaterialTheme.colorScheme.surfaceVariant
+                                                    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                                                )
                                                 .border(
                                                     width = 1.dp,
-                                                    color = MaterialTheme.colorScheme.surfaceVariant,
+                                                    color = if (isDraggingItem) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant,
                                                     shape = RoundedCornerShape(12.dp)
                                                 )
-                                                .clickable {
+                                                .clickable(enabled = draggedVaultKey == null) {
                                                     viewModel.setVaultUri(context, uriItem)
                                                 }
                                                 .padding(horizontal = 14.dp, vertical = 12.dp)

@@ -71,6 +71,7 @@ import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.MotionPhotosOn
 import androidx.compose.material.icons.filled.PhotoLibrary
@@ -356,6 +357,7 @@ fun GalleryScreen(
     val currentImportIsVideo by viewModel.currentImportIsVideo.collectAsState()
     val currentImportIsLivePhoto by viewModel.currentImportIsLivePhoto.collectAsState()
     val isCancellingImport by viewModel.isCancellingImport.collectAsState()
+    val isExporting by viewModel.isExporting.collectAsState()
     val videoFramePickRequest by viewModel.videoFramePickRequest.collectAsState()
     val error by viewModel.error.collectAsState()
     val animatingItem by viewModel.animatingItem.collectAsState()
@@ -370,6 +372,7 @@ fun GalleryScreen(
     var isSelectionMode by remember { mutableStateOf(false) }
     var selectedEncryptedNames by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showBulkDeleteDialog by remember { mutableStateOf(false) }
+    var showBulkExportDialog by remember { mutableStateOf(false) }
     var isImportMenuExpanded by remember { mutableStateOf(false) }
 
     val orderedKeys = remember(items) { items.map { it.encryptedName } }
@@ -425,6 +428,35 @@ fun GalleryScreen(
                 }
                 .build()
         }
+    }
+
+    val mediaPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ -> }
+
+    // Để giữ được GPS khi import cần ĐỦ cả 2 quyền:
+    //  - READ_MEDIA_IMAGES/VIDEO (Android 13+) hoặc READ_EXTERNAL_STORAGE (<13): mở được Uri MediaStore gốc
+    //  - ACCESS_MEDIA_LOCATION: hệ thống không xoá EXIF/ISO-6709 GPS khỏi bản gốc
+    LaunchedEffect(Unit) {
+        try {
+            val wanted = mutableListOf<String>()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                wanted += android.Manifest.permission.READ_MEDIA_IMAGES
+                wanted += android.Manifest.permission.READ_MEDIA_VIDEO
+            } else {
+                wanted += android.Manifest.permission.READ_EXTERNAL_STORAGE
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wanted += android.Manifest.permission.ACCESS_MEDIA_LOCATION
+            }
+            val missing = wanted.filter {
+                androidx.core.content.ContextCompat.checkSelfPermission(context, it) !=
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            if (missing.isNotEmpty()) {
+                mediaPermLauncher.launch(missing.toTypedArray())
+            }
+        } catch (_: Exception) {}
     }
 
     val importLauncher = rememberLauncherForActivityResult(
@@ -540,25 +572,37 @@ fun GalleryScreen(
                         }
                     }
 
-                    val showDeleteAction = isSelectionMode && selectedEncryptedNames.isNotEmpty()
+                    val showSelectionActions = isSelectionMode && selectedEncryptedNames.isNotEmpty()
                     AnimatedContent(
-                        targetState = showDeleteAction,
+                        targetState = showSelectionActions,
                         transitionSpec = {
                             (fadeIn(tween(180)) + scaleIn(initialScale = 0.75f, animationSpec = spring(dampingRatio = 0.7f)))
                                 .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.75f, animationSpec = tween(140)))
                         },
-                        label = "refresh_or_delete_action"
-                    ) { isDelete ->
-                        if (isDelete) {
-                            IconButton(
-                                onClick = { showBulkDeleteDialog = true },
-                                modifier = Modifier.testTag("delete_selected_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Delete,
-                                    contentDescription = "Delete Selected",
-                                    tint = MaterialTheme.colorScheme.error
-                                )
+                        label = "refresh_or_selection_actions"
+                    ) { hasSelectedItems ->
+                        if (hasSelectedItems) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = { showBulkExportDialog = true },
+                                    modifier = Modifier.testTag("export_selected_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.FileDownload,
+                                        contentDescription = "Export Selected",
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { showBulkDeleteDialog = true },
+                                    modifier = Modifier.testTag("delete_selected_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Delete,
+                                        contentDescription = "Delete Selected",
+                                        tint = MaterialTheme.colorScheme.error
+                                    )
+                                }
                             }
                         } else {
                             IconButton(
@@ -1083,6 +1127,47 @@ fun GalleryScreen(
                 )
             }
 
+            if (showBulkExportDialog) {
+                val selectedItemsList = remember(items, selectedEncryptedNames) {
+                    items.filter { it.encryptedName in selectedEncryptedNames }
+                }
+                AlertDialog(
+                    onDismissRequest = { showBulkExportDialog = false },
+                    title = {
+                        Text(
+                            text = "Export ${selectedItemsList.size} Selected Media?",
+                            fontWeight = FontWeight.Bold
+                        )
+                    },
+                    text = {
+                        Text(
+                            text = "Decrypt and export ${selectedItemsList.size} original photo/video file(s) directly into this Vault folder?"
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = {
+                                showBulkExportDialog = false
+                                val toExport = selectedItemsList
+                                viewModel.exportMultipleMedia(context, toExport) {
+                                    selectedEncryptedNames = emptySet()
+                                    isSelectionMode = false
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                            modifier = Modifier.testTag("confirm_bulk_export_button")
+                        ) {
+                            Text("EXPORT", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary)
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showBulkExportDialog = false }) {
+                            Text("CANCEL")
+                        }
+                    }
+                )
+            }
+
             AnimatedVisibility(
                 visible = isImportMenuExpanded,
                 enter = fadeIn(tween(150)),
@@ -1233,7 +1318,9 @@ fun GalleryScreen(
 
                             Text(
                                 text = when {
+                                    isCancellingImport && isExporting -> "Cancelling & cleaning up exported files..."
                                     isCancellingImport -> "Cancelling & deleting imported files..."
+                                    isExporting && importProgress > 0f -> "Decrypting & exporting original media..."
                                     importProgress > 0f -> "Encrypting media blocks..."
                                     else -> "Preparing file..."
                                 },
@@ -1275,7 +1362,11 @@ fun GalleryScreen(
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = if (isCancellingImport) "CANCELLING..." else "CANCEL IMPORT",
+                                        text = when {
+                                            isCancellingImport -> "CANCELLING..."
+                                            isExporting -> "CANCEL EXPORT"
+                                            else -> "CANCEL IMPORT"
+                                        },
                                         fontSize = 12.sp,
                                         fontWeight = FontWeight.Bold,
                                         letterSpacing = 0.8.sp

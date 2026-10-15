@@ -30,6 +30,9 @@ object CryptoEngine {
     private const val FLAG_HAS_DIMENSIONS = 1
     private const val FLAG_IS_LIVE_PHOTO = 2
 
+    const val NOTES_FILE_NAME = "media notes.txt"
+    const val GPS_FILE_NAME = "media gps.txt"
+
     val SGV2_MAGIC = "SGV2".toByteArray(Charsets.UTF_8)
 
     enum class Tier { THUMB, SCREEN, FULL }
@@ -122,6 +125,96 @@ object CryptoEngine {
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, iv))
             String(cipher.doFinal(ciphertext), Charsets.UTF_8)
         } catch (e: Exception) { null }
+    }
+
+    /**
+     * Mã hoá chuỗi văn bản bất kỳ bằng AES-256-GCM (kèm 12-byte random Nonce) và xuất ra Base64.
+     * Dùng cho nội dung của "media notes.txt" và "media gps.txt".
+     */
+    fun encryptTextContent(plainText: String, dek: ByteArray): String {
+        val encryptedBytes = encryptBlob(plainText.toByteArray(Charsets.UTF_8), dek)
+        return Base64.encodeToString(encryptedBytes, Base64.NO_WRAP)
+    }
+
+    /**
+     * Giải mã nội dung văn bản đã mã hoá bởi encryptTextContent (hoặc raw AES-GCM blob).
+     */
+    fun decryptTextContent(encryptedText: String, dek: ByteArray): String? {
+        val trimmed = encryptedText.trim()
+        if (trimmed.isEmpty()) return null
+        return try {
+            val rawBlob = Base64.decode(trimmed, Base64.NO_WRAP)
+            if (rawBlob.size <= 12 + TAG_SIZE_BYTES) return null
+            String(decryptBlob(rawBlob, dek), Charsets.UTF_8)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Đọc và giải mã file văn bản cấu hình trong Vault (ví dụ: "media notes.txt", "media gps.txt").
+     */
+    fun readEncryptedTextFile(
+        context: Context,
+        directoryUri: Uri,
+        fileName: String,
+        dek: ByteArray
+    ): String? {
+        val fileUri = findChildUri(context, directoryUri, fileName) ?: return null
+        return try {
+            val bytes = context.contentResolver.openInputStream(fileUri)?.use { it.readBytes() }
+                ?: return null
+            if (bytes.isEmpty()) return null
+            val asText = bytes.toString(Charsets.UTF_8)
+            decryptTextContent(asText, dek) ?: run {
+                if (bytes.size > 12 + TAG_SIZE_BYTES) {
+                    String(decryptBlob(bytes, dek), Charsets.UTF_8)
+                } else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Mã hoá toàn bộ nội dung plainText bằng AES-256-GCM và ghi đè an toàn vào fileName trong Vault
+     * (ví dụ: "media notes.txt" hoặc "media gps.txt"), đảm bảo không sinh ra file trùng lặp "(1)".
+     */
+    fun writeEncryptedTextFile(
+        context: Context,
+        directoryUri: Uri,
+        fileName: String,
+        plainText: String,
+        dek: ByteArray
+    ): Boolean {
+        return try {
+            val encryptedPayload = encryptTextContent(plainText, dek).toByteArray(Charsets.UTF_8)
+            var targetUri = findChildUri(context, directoryUri, fileName)
+            if (targetUri != null) {
+                val overwritten = try {
+                    context.contentResolver.openOutputStream(targetUri, "wt")?.use { out ->
+                        out.write(encryptedPayload)
+                        out.flush()
+                    } != null
+                } catch (_: Exception) {
+                    false
+                }
+                if (overwritten) return true
+                deleteFile(context, targetUri)
+            }
+
+            targetUri = createChildFile(context, directoryUri, fileName, "text/plain")
+                ?: createChildFile(context, directoryUri, fileName, "application/octet-stream")
+                        ?: return false
+
+            context.contentResolver.openOutputStream(targetUri)?.use { out ->
+                out.write(encryptedPayload)
+                out.flush()
+            } != null
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
     }
 
     fun calculateBlockIv(fileNonce: ByteArray, blockIndex: Long): ByteArray {
@@ -356,6 +449,105 @@ object CryptoEngine {
             val read = input.read(target, offset, target.size - offset)
             if (read == -1) throw IOException("Unexpected EOF while reading tier blob ($offset / ${target.size})")
             offset += read
+        }
+    }
+
+    /**
+     * Giải mã ngẫu nhiên O(1) một phân đoạn byte [plainOffset .. plainOffset + maxLength) trong Tier FULL.
+     * Rất hữu ích để đọc nhanh phần đầu (EXIF/XMP) và phần cuối (MP4 moov/udta/©xyz/loci) của video/Live Photo lớn.
+     */
+    fun decryptSgv2FullSlice(
+        context: Context,
+        uri: Uri,
+        dek: ByteArray,
+        plainOffset: Long,
+        maxLength: Int
+    ): ByteArray? {
+        if (maxLength <= 0) return ByteArray(0)
+        val pfd = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
+        return try {
+            ParcelFileDescriptor.AutoCloseInputStream(pfd).use { fis ->
+                val channel = fis.channel
+                val totalFileSize = channel.size()
+                if (totalFileSize < 96) return null
+
+                val headerBuffer = ByteBuffer.allocate(96)
+                while (headerBuffer.hasRemaining()) {
+                    if (channel.read(headerBuffer) == -1) break
+                }
+                headerBuffer.flip()
+                if (headerBuffer.remaining() < 96) return null
+
+                val magic = ByteArray(4)
+                headerBuffer.get(magic)
+                if (!magic.contentEquals(SGV2_MAGIC)) return null
+
+                val headerNonce = ByteArray(12)
+                headerBuffer.get(headerNonce)
+                val headerCipher = ByteArray(80)
+                headerBuffer.get(headerCipher)
+
+                val headerDecCipher = Cipher.getInstance("AES/GCM/NoPadding")
+                headerDecCipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(TAG_SIZE_BITS, headerNonce))
+                val headerPlain = ByteBuffer.wrap(headerDecCipher.doFinal(headerCipher))
+
+                val thumbLen = headerPlain.long
+                val screenLen = headerPlain.long
+                val offsetFull = 96L + thumbLen + screenLen
+                val fullTierEncryptedSize = (totalFileSize - offsetFull).coerceAtLeast(0L)
+                if (fullTierEncryptedSize <= 12L) return null
+
+                val totalPlainLen = getDecryptedLength(fullTierEncryptedSize)
+                val safeStart = plainOffset.coerceIn(0L, totalPlainLen)
+                val safeEnd = (safeStart + maxLength.toLong()).coerceIn(safeStart, totalPlainLen)
+                if (safeEnd <= safeStart) return ByteArray(0)
+
+                val fileNonceBuf = ByteBuffer.allocate(12)
+                channel.position(offsetFull)
+                while (fileNonceBuf.hasRemaining()) {
+                    if (channel.read(fileNonceBuf) == -1) break
+                }
+                fileNonceBuf.flip()
+                if (fileNonceBuf.remaining() < 12) return null
+                val fileNonce = ByteArray(12)
+                fileNonceBuf.get(fileNonce)
+
+                val firstBlock = safeStart / BLOCK_SIZE
+                val lastBlock = (safeEnd - 1L) / BLOCK_SIZE
+                val out = java.io.ByteArrayOutputStream((safeEnd - safeStart).toInt())
+                val blockCipher = Cipher.getInstance("AES/GCM/NoPadding")
+                val keySpec = SecretKeySpec(dek, "AES")
+
+                for (bIdx in firstBlock..lastBlock) {
+                    val encBlockPos = offsetFull + 12L + bIdx * ENCRYPTED_BLOCK_SIZE
+                    val encBlockEnd = minOf(totalFileSize, encBlockPos + ENCRYPTED_BLOCK_SIZE)
+                    val encBlockLen = (encBlockEnd - encBlockPos).toInt()
+                    if (encBlockLen <= TAG_SIZE_BYTES) break
+
+                    val encBuf = ByteBuffer.allocate(encBlockLen)
+                    channel.position(encBlockPos)
+                    while (encBuf.hasRemaining()) {
+                        if (channel.read(encBuf) == -1) break
+                    }
+                    encBuf.flip()
+                    val encBytes = ByteArray(encBuf.remaining())
+                    encBuf.get(encBytes)
+
+                    val blockIv = calculateBlockIv(fileNonce, bIdx)
+                    blockCipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(TAG_SIZE_BITS, blockIv))
+                    val plainBlock = blockCipher.doFinal(encBytes)
+
+                    val blockPlainStart = bIdx * BLOCK_SIZE
+                    val cutFrom = (safeStart - blockPlainStart).coerceIn(0L, plainBlock.size.toLong()).toInt()
+                    val cutTo = (safeEnd - blockPlainStart).coerceIn(0L, plainBlock.size.toLong()).toInt()
+                    if (cutTo > cutFrom) {
+                        out.write(plainBlock, cutFrom, cutTo - cutFrom)
+                    }
+                }
+                out.toByteArray()
+            }
+        } catch (e: Exception) {
+            null
         }
     }
 

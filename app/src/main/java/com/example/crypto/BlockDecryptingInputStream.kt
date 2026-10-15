@@ -12,7 +12,7 @@ class BlockDecryptingInputStream(
 
     private val fileNonce = ByteArray(12)
     private var isNonceRead = false
-    
+
     private var blockIndex: Long = 0
     private var decryptedBuffer: ByteArray? = null
     private var bufferOffset = 0
@@ -63,12 +63,12 @@ class BlockDecryptingInputStream(
         val keySpec = SecretKeySpec(dek, "AES")
         val gcmSpec = GCMParameterSpec(128, blockIv)
         cipher.init(Cipher.DECRYPT_MODE, keySpec, gcmSpec)
-        
+
         decryptedBuffer = cipher.doFinal(encryptedBlock, 0, totalRead)
         bufferOffset = 0
         bufferLength = decryptedBuffer?.size ?: 0
         blockIndex++
-        
+
         return bufferLength > 0
     }
 
@@ -95,6 +95,26 @@ class BlockDecryptingInputStream(
         System.arraycopy(decryptedBuffer!!, bufferOffset, b, off, toCopy)
         bufferOffset += toCopy
         return toCopy
+    }
+
+    override fun skip(n: Long): Long {
+        if (n <= 0L) return 0L
+        var remaining = n
+        val scratch = ByteArray(4096)
+        while (remaining > 0L) {
+            if (bufferOffset < bufferLength) {
+                val avail = (bufferLength - bufferOffset).toLong()
+                val step = minOf(remaining, avail).toInt()
+                bufferOffset += step
+                remaining -= step
+            } else {
+                val toRead = minOf(remaining, scratch.size.toLong()).toInt()
+                val r = read(scratch, 0, toRead)
+                if (r <= 0) break
+                remaining -= r
+            }
+        }
+        return n - remaining
     }
 
     override fun close() {
