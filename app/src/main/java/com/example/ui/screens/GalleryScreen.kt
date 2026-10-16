@@ -117,6 +117,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathMeasure
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
@@ -152,27 +153,33 @@ import kotlin.math.abs
 // CACHE BITMAP THUMB DÙNG CHUNG GIỮA GalleryScreen VÀ MediaViewerScreen
 // ------------------------------------------------------------------------------------
 object ThumbBitmapCache {
-    private const val MAX_ENTRIES = 80
+    private val maxCacheKb: Int = run {
+        val maxMemKb = (Runtime.getRuntime().maxMemory() / 1024L).toInt()
+        (maxMemKb / 10).coerceIn(12 * 1024, 32 * 1024)
+    }
 
-    private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
-        MAX_ENTRIES, 0.75f, true
-    ) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, androidx.compose.ui.graphics.ImageBitmap>?
-        ): Boolean = size > MAX_ENTRIES
+    private val cache = object : android.util.LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(maxCacheKb) {
+        override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
+            return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
+        }
     }
 
     @Synchronized
-    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache[key]
+    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache.get(key)
 
     @Synchronized
     fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
-        cache[key] = bitmap
+        cache.put(key, bitmap)
     }
 
     @Synchronized
     fun remove(key: String) {
         cache.remove(key)
+    }
+
+    @Synchronized
+    fun clear() {
+        cache.evictAll()
     }
 }
 
@@ -218,10 +225,106 @@ private fun findMediaItemIndexAtPosition(
  * Đường viền tiến độ hình vuông bo góc (Square Progress Indicator) bao sát quanh ô thumbnail vuông.
  * Bắt đầu từ chính giữa cạnh trên (12 giờ) và chạy thuận chiều kim đồng hồ quanh 4 cạnh hình vuông.
  */
+/**
+ * Vòng tròn tiến trình (Process Circle) tự động lấp đầy 100% và vẽ dấu tick animation trước khi ẩn.
+ */
+@Composable
+private fun AnimatedCircularProgressWithTick(
+    isCompletingOrCompleted: Boolean,
+    isTickVisible: Boolean,
+    color: Color,
+    trackColor: Color = color.copy(alpha = 0.24f),
+    size: Dp = 20.dp,
+    strokeWidth: Dp = 2.5.dp,
+    modifier: Modifier = Modifier
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "gallery_circle_spin")
+    val spinRotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "spin_angle"
+    )
+
+    val sweepProgress by animateFloatAsState(
+        targetValue = if (isCompletingOrCompleted) 1f else 0.28f,
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "circle_sweep_100"
+    )
+
+    val tickProgress by animateFloatAsState(
+        targetValue = if (isTickVisible) 1f else 0f,
+        animationSpec = if (isTickVisible) {
+            tween(durationMillis = 280, easing = FastOutSlowInEasing)
+        } else {
+            tween(durationMillis = 80)
+        },
+        label = "circle_tick_draw"
+    )
+
+    Canvas(modifier = modifier.size(size)) {
+        val strokePx = strokeWidth.toPx()
+        val diameter = this.size.minDimension - strokePx
+        val topLeftOffset = Offset((this.size.width - diameter) / 2f, (this.size.height - diameter) / 2f)
+        val arcSize = ComposeSize(diameter, diameter)
+
+        drawArc(
+            color = trackColor,
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = topLeftOffset,
+            size = arcSize,
+            style = Stroke(width = strokePx, cap = StrokeCap.Round)
+        )
+
+        val startAngle = if (isCompletingOrCompleted) -90f else (spinRotation - 90f)
+        val sweepAngle = (sweepProgress * 360f).coerceIn(20f, 360f)
+
+        drawArc(
+            color = color,
+            startAngle = startAngle,
+            sweepAngle = sweepAngle,
+            useCenter = false,
+            topLeft = topLeftOffset,
+            size = arcSize,
+            style = Stroke(width = strokePx, cap = StrokeCap.Round)
+        )
+
+        if (tickProgress > 0.01f) {
+            val w = this.size.width
+            val h = this.size.height
+            val fullTickPath = Path().apply {
+                moveTo(w * 0.27f, h * 0.52f)
+                lineTo(w * 0.44f, h * 0.69f)
+                lineTo(w * 0.75f, h * 0.34f)
+            }
+            val pm = PathMeasure()
+            pm.setPath(fullTickPath, false)
+            val tickSegment = Path()
+            pm.getSegment(0f, pm.length * tickProgress.coerceIn(0f, 1f), tickSegment, true)
+
+            drawPath(
+                path = tickSegment,
+                color = color,
+                style = Stroke(
+                    width = strokePx,
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round
+                )
+            )
+        }
+    }
+}
+
 @Composable
 private fun SquareProgressBox(
     progress: Float,
     isIndeterminate: Boolean,
+    isCompleted: Boolean = false,
     activeColor: Color,
     trackColor: Color,
     boxSize: Dp,
@@ -238,6 +341,25 @@ private fun SquareProgressBox(
             repeatMode = RepeatMode.Restart
         ),
         label = "square_phase"
+    )
+
+    val tickDrawProgress by animateFloatAsState(
+        targetValue = if (isCompleted) 1f else 0f,
+        animationSpec = if (isCompleted) {
+            tween(durationMillis = 320, easing = FastOutSlowInEasing)
+        } else {
+            tween(durationMillis = 100)
+        },
+        label = "square_tick_draw_progress"
+    )
+
+    val tickBadgeScale by animateFloatAsState(
+        targetValue = if (isCompleted) 1f else 0.65f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium
+        ),
+        label = "square_tick_badge_scale"
     )
 
     Box(
@@ -304,7 +426,7 @@ private fun SquareProgressBox(
 
             if (totalLen > 0f) {
                 val segmentPath = Path()
-                if (isIndeterminate) {
+                if (isIndeterminate && !isCompleted) {
                     val segLen = totalLen * 0.28f
                     val startDist = indeterminatePhase * totalLen
                     val endDist = startDist + segLen
@@ -315,7 +437,8 @@ private fun SquareProgressBox(
                         pathMeasure.getSegment(0f, endDist - totalLen, segmentPath, true)
                     }
                 } else {
-                    val stopDist = (progress.coerceIn(0f, 1f)) * totalLen
+                    val effectiveProg = if (isCompleted) 1f else progress.coerceIn(0f, 1f)
+                    val stopDist = effectiveProg * totalLen
                     if (stopDist > 0.5f) {
                         pathMeasure.getSegment(0f, stopDist, segmentPath, true)
                     }
@@ -325,6 +448,45 @@ private fun SquareProgressBox(
                     path = segmentPath,
                     color = activeColor,
                     style = Stroke(width = strokePx, cap = StrokeCap.Round)
+                )
+            }
+
+            // Khi tiến trình hoàn tất 100%, vẽ huy hiệu tròn + dấu tick animation ở chính giữa
+            if (tickDrawProgress > 0.01f) {
+                val cx = size.width / 2f
+                val cy = size.height / 2f
+                val badgeRadius = (minOf(size.width, size.height) * 0.26f) * tickBadgeScale
+
+                drawCircle(
+                    color = Color.Black.copy(alpha = 0.68f * tickDrawProgress),
+                    radius = badgeRadius,
+                    center = Offset(cx, cy)
+                )
+                drawCircle(
+                    color = activeColor.copy(alpha = tickDrawProgress),
+                    radius = badgeRadius,
+                    center = Offset(cx, cy),
+                    style = Stroke(width = 2.5.dp.toPx())
+                )
+
+                val tickFullPath = Path().apply {
+                    moveTo(cx - badgeRadius * 0.44f, cy + badgeRadius * 0.04f)
+                    lineTo(cx - badgeRadius * 0.10f, cy + badgeRadius * 0.38f)
+                    lineTo(cx + badgeRadius * 0.48f, cy - badgeRadius * 0.30f)
+                }
+                val tickMeasure = PathMeasure()
+                tickMeasure.setPath(tickFullPath, false)
+                val tickSeg = Path()
+                tickMeasure.getSegment(0f, tickMeasure.length * tickDrawProgress.coerceIn(0f, 1f), tickSeg, true)
+
+                drawPath(
+                    path = tickSeg,
+                    color = activeColor,
+                    style = Stroke(
+                        width = 3.5.dp.toPx(),
+                        cap = StrokeCap.Round,
+                        join = StrokeJoin.Round
+                    )
                 )
             }
         }
@@ -351,6 +513,7 @@ fun GalleryScreen(
     val dek by viewModel.dek.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val importProgress by viewModel.importProgress.collectAsState()
+    val isProcessCompleted by viewModel.isProcessCompleted.collectAsState()
     val importQueueTotal by viewModel.importQueueTotal.collectAsState()
     val importQueueIndex by viewModel.importQueueIndex.collectAsState()
     val currentImportThumb by viewModel.currentImportThumb.collectAsState()
@@ -1241,10 +1404,11 @@ fun GalleryScreen(
                                 .widthIn(min = 240.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            // Đường tiến độ bao quanh hình vuông
+                            // Đường tiến độ bao quanh hình vuông (chờ chạy đủ 100% + vẽ dấu tick trước khi ẩn)
                             SquareProgressBox(
-                                progress = smoothImportProgress,
-                                isIndeterminate = importProgress <= 0f || isCancellingImport,
+                                progress = if (isProcessCompleted) 1f else smoothImportProgress,
+                                isIndeterminate = (importProgress <= 0f && !isProcessCompleted) || isCancellingImport,
+                                isCompleted = isProcessCompleted,
                                 activeColor = if (isCancellingImport) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                                 trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
                                 boxSize = squareProgressBoxSizeDp,
@@ -1306,9 +1470,10 @@ fun GalleryScreen(
 
                             Spacer(modifier = Modifier.height(14.dp))
 
-                            if (importProgress > 0f && !isCancellingImport) {
+                            if ((importProgress > 0f || isProcessCompleted) && !isCancellingImport) {
+                                val pct = if (isProcessCompleted) 100 else (smoothImportProgress * 100).toInt().coerceIn(0, 100)
                                 Text(
-                                    text = "${(smoothImportProgress * 100).toInt()}%",
+                                    text = "$pct%",
                                     fontSize = 15.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.primary
@@ -1320,9 +1485,10 @@ fun GalleryScreen(
                                 text = when {
                                     isCancellingImport && isExporting -> "Cancelling & cleaning up exported files..."
                                     isCancellingImport -> "Cancelling & deleting imported files..."
+                                    isProcessCompleted -> "Completed!"
                                     isExporting && importProgress > 0f -> "Decrypting & exporting original media..."
                                     importProgress > 0f -> "Encrypting media blocks..."
-                                    else -> "Preparing file..."
+                                    else -> "Processing..."
                                 },
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium,
@@ -1410,6 +1576,11 @@ fun VideoFramePickerDialog(
     var currentPreviewBitmap by remember(request.uri, request.queueIndex) { mutableStateOf<Bitmap?>(null) }
     var filmstripBitmaps by remember(request.uri, request.queueIndex) { mutableStateOf<List<Bitmap>>(emptyList()) }
     var isExtractingExactFrame by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
+    var isExtractFrameCompleting by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
+    var isExtractFrameTickVisible by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
+    var isInitialFrameLoaderVisible by remember(request.uri, request.queueIndex) { mutableStateOf(true) }
+    var isInitialFrameCompleting by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
+    var isInitialFrameTickVisible by remember(request.uri, request.queueIndex) { mutableStateOf(false) }
     val goldColor = MaterialTheme.colorScheme.primary
 
     LaunchedEffect(request.uri, request.queueIndex) {
@@ -1422,6 +1593,11 @@ fun VideoFramePickerDialog(
                 withContext(Dispatchers.Main) {
                     durationMs = dur.coerceAtLeast(1L)
                     currentPreviewBitmap = firstFrame
+                    isInitialFrameCompleting = true
+                    delay(180L)
+                    isInitialFrameTickVisible = true
+                    delay(320L)
+                    isInitialFrameLoaderVisible = false
                 }
 
                 if (dur > 0L) {
@@ -1474,6 +1650,8 @@ fun VideoFramePickerDialog(
             }
         } else {
             delay(100L)
+            isExtractFrameCompleting = false
+            isExtractFrameTickVisible = false
             isExtractingExactFrame = true
             withContext(Dispatchers.IO) {
                 val retriever = MediaMetadataRetriever()
@@ -1490,7 +1668,13 @@ fun VideoFramePickerDialog(
                 } finally {
                     try { retriever.release() } catch (_: Exception) {}
                     withContext(Dispatchers.Main) {
+                        isExtractFrameCompleting = true
+                        delay(180L)
+                        isExtractFrameTickVisible = true
+                        delay(320L)
                         isExtractingExactFrame = false
+                        isExtractFrameCompleting = false
+                        isExtractFrameTickVisible = false
                     }
                 }
             }
@@ -1634,11 +1818,23 @@ fun VideoFramePickerDialog(
                             drawLine(goldColor, Offset(sqRight - cornerLen, sqBottom), Offset(sqRight, sqBottom), cornerStroke)
                             drawLine(goldColor, Offset(sqRight, sqBottom - cornerLen), Offset(sqRight, sqBottom), cornerStroke)
                         }
-                    } else {
-                        CircularProgressIndicator(
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(36.dp)
-                        )
+                    }
+                    if (bmp == null || isInitialFrameLoaderVisible) {
+                        Box(
+                            modifier = Modifier
+                                .size(54.dp)
+                                .clip(RoundedCornerShape(27.dp))
+                                .background(Color.Black.copy(alpha = 0.65f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            AnimatedCircularProgressWithTick(
+                                isCompletingOrCompleted = isInitialFrameCompleting,
+                                isTickVisible = isInitialFrameTickVisible,
+                                color = MaterialTheme.colorScheme.primary,
+                                size = 36.dp,
+                                strokeWidth = 3.dp
+                            )
+                        }
                     }
 
                     // PREVIEW THUMBNAIL KÍCH THƯỚC THẬT (Hình vuông 216 x 216 px) Ở GÓC TRÊN BÊN PHẢI VỚI FADE IN / OUT
@@ -1843,9 +2039,11 @@ fun VideoFramePickerDialog(
                                     verticalAlignment = Alignment.CenterVertically,
                                     horizontalArrangement = Arrangement.Center
                                 ) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(18.dp),
+                                    AnimatedCircularProgressWithTick(
+                                        isCompletingOrCompleted = isExtractFrameCompleting,
+                                        isTickVisible = isExtractFrameTickVisible,
                                         color = MaterialTheme.colorScheme.onPrimary,
+                                        size = 18.dp,
                                         strokeWidth = 2.dp
                                     )
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -1897,33 +2095,44 @@ fun GalleryGridItem(
     onPositioned: (FloatArray) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var itemBounds by remember { mutableStateOf<FloatArray?>(null) }
+    val context = LocalContext.current
+    val itemBoundsRef = remember(item.encryptedName) { arrayOfNulls<FloatArray>(1) }
+    var cachedThumb by remember(item.encryptedName) {
+        mutableStateOf(ThumbBitmapCache.get(item.encryptedName))
+    }
 
-    val thumbUriWithTier = item.uri.buildUpon().appendQueryParameter("tier", "THUMB").build()
-    val painter = if (imageLoader != null) {
+    val imageRequest = remember(item.uri, context) {
+        val thumbUriWithTier = item.uri.buildUpon().appendQueryParameter("tier", "THUMB").build()
+        ImageRequest.Builder(context)
+            .data(thumbUriWithTier)
+            .size(Size.ORIGINAL)
+            .build()
+    }
+
+    val painter = if (cachedThumb == null && imageLoader != null) {
         rememberAsyncImagePainter(
-            model = ImageRequest.Builder(LocalContext.current)
-                .data(thumbUriWithTier)
-                .size(Size.ORIGINAL)
-                .build(),
+            model = imageRequest,
             imageLoader = imageLoader
         )
     } else null
 
     val painterState = painter?.state
-    var intrinsicWidth by remember { mutableStateOf(0f) }
-    var intrinsicHeight by remember { mutableStateOf(0f) }
+    var intrinsicWidth by remember(item.encryptedName) {
+        mutableFloatStateOf(cachedThumb?.width?.toFloat() ?: 0f)
+    }
+    var intrinsicHeight by remember(item.encryptedName) {
+        mutableFloatStateOf(cachedThumb?.height?.toFloat() ?: 0f)
+    }
 
-    val isImageLoaded = painterState is coil.compose.AsyncImagePainter.State.Success
-    if (isImageLoaded) {
-        val success = painterState as coil.compose.AsyncImagePainter.State.Success
-        intrinsicWidth = success.result.drawable.intrinsicWidth.toFloat()
-        intrinsicHeight = success.result.drawable.intrinsicHeight.toFloat()
+    val isImageLoaded = cachedThumb != null || painterState is coil.compose.AsyncImagePainter.State.Success
+    if (painterState is coil.compose.AsyncImagePainter.State.Success) {
+        intrinsicWidth = painterState.result.drawable.intrinsicWidth.toFloat()
+        intrinsicHeight = painterState.result.drawable.intrinsicHeight.toFloat()
     }
 
     val imageLoadedAlpha by animateFloatAsState(
         targetValue = if (isImageLoaded) 1f else 0f,
-        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        animationSpec = tween(durationMillis = if (cachedThumb != null) 0 else 180, easing = FastOutSlowInEasing),
         label = "thumb_fade_in"
     )
 
@@ -1944,15 +2153,19 @@ fun GalleryGridItem(
     LaunchedEffect(item.encryptedName, painterState) {
         val successState = painterState as? coil.compose.AsyncImagePainter.State.Success ?: return@LaunchedEffect
         val bmp = (successState.result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap ?: return@LaunchedEffect
-        ThumbBitmapCache.put(item.encryptedName, bmp.asImageBitmap())
+        val imgBmp = bmp.asImageBitmap()
+        ThumbBitmapCache.put(item.encryptedName, imgBmp)
+        cachedThumb = imgBmp
     }
 
     LaunchedEffect(intrinsicWidth, intrinsicHeight) {
         if (intrinsicWidth > 0f && intrinsicHeight > 0f) {
-            itemBounds?.let { b ->
-                val updated = floatArrayOf(b[0], b[1], b[2], b[3], intrinsicWidth, intrinsicHeight)
-                itemBounds = updated
-                onPositioned(updated)
+            itemBoundsRef[0]?.let { b ->
+                if (abs(b[4] - intrinsicWidth) > 0.5f || abs(b[5] - intrinsicHeight) > 0.5f) {
+                    val updated = floatArrayOf(b[0], b[1], b[2], b[3], intrinsicWidth, intrinsicHeight)
+                    itemBoundsRef[0] = updated
+                    onPositioned(updated)
+                }
             }
         }
     }
@@ -1967,19 +2180,29 @@ fun GalleryGridItem(
             .onGloballyPositioned { coordinates ->
                 val position = coordinates.positionInWindow()
                 val size = coordinates.size
-                val bounds = floatArrayOf(
-                    position.x,
-                    position.y,
-                    size.width.toFloat(),
-                    size.height.toFloat(),
-                    intrinsicWidth,
-                    intrinsicHeight
-                )
-                itemBounds = bounds
-                onPositioned(bounds)
+                val w = size.width.toFloat()
+                val h = size.height.toFloat()
+                val prev = itemBoundsRef[0]
+                if (prev == null ||
+                    abs(prev[0] - position.x) > 0.5f ||
+                    abs(prev[1] - position.y) > 0.5f ||
+                    abs(prev[2] - w) > 0.5f ||
+                    abs(prev[3] - h) > 0.5f
+                ) {
+                    val bounds = floatArrayOf(
+                        position.x,
+                        position.y,
+                        w,
+                        h,
+                        intrinsicWidth,
+                        intrinsicHeight
+                    )
+                    itemBoundsRef[0] = bounds
+                    onPositioned(bounds)
+                }
             }
             .clickable {
-                onItemClick(itemBounds)
+                onItemClick(itemBoundsRef[0])
             }
             .testTag("grid_item_${item.encryptedName}")
     ) {
@@ -2012,7 +2235,15 @@ fun GalleryGridItem(
                 }
             }
 
-            if (painter != null) {
+            val thumbBmp = cachedThumb
+            if (thumbBmp != null) {
+                Image(
+                    bitmap = thumbBmp,
+                    contentDescription = item.originalName,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else if (painter != null) {
                 Image(
                     painter = painter,
                     contentDescription = item.originalName,

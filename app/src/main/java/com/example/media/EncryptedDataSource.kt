@@ -20,6 +20,7 @@ class EncryptedDataSource(
     private val dek: ByteArray
 ) : BaseDataSource(/* isNetwork = */ false) {
 
+    private val lock = Any()
     private var dataSpec: DataSpec? = null
     private var pfd: ParcelFileDescriptor? = null
     private var fileChannel: FileChannel? = null
@@ -37,85 +38,96 @@ class EncryptedDataSource(
     private var cachedBlockIndex: Long = -1
     private var cachedBlockData: ByteArray? = null
 
-    override fun open(dataSpec: DataSpec): Long {
+    override fun open(dataSpec: DataSpec): Long = synchronized(lock) {
         transferInitializing(dataSpec)
         this.dataSpec = dataSpec
         val uri = dataSpec.uri
         val isLivePhotoVideo = uri.getQueryParameter("live") == "1"
 
-        pfd = context.contentResolver.openFileDescriptor(uri, "r")
-            ?: throw IOException("Failed to open file descriptor")
-        val fileInputStream = FileInputStream(pfd!!.fileDescriptor)
-        fileChannel = fileInputStream.channel
-        val totalFileSize = fileChannel!!.size()
+        try {
+            val openedPfd = context.contentResolver.openFileDescriptor(uri, "r")
+                ?: throw IOException("Failed to open file descriptor for $uri")
+            pfd = openedPfd
+            val fileInputStream = FileInputStream(openedPfd.fileDescriptor)
+            val channel = fileInputStream.channel
+            fileChannel = channel
+            val totalFileSize = channel.size()
 
-        if (totalFileSize < 96) throw IOException("File too small to be SGV2")
+            if (totalFileSize < 96) throw IOException("File too small to be SGV2 ($totalFileSize bytes)")
 
-        // Parse SGV2 Header to find Tier 3 (Full) Offset & Live Photo slice
-        val headerBuffer = ByteBuffer.allocate(96)
-        fileChannel!!.read(headerBuffer, 0)
-        headerBuffer.flip()
+            // Parse SGV2 Header to find Tier 3 (Full) Offset & Live Photo slice
+            val headerBuffer = ByteBuffer.allocate(96)
+            channel.read(headerBuffer, 0L)
+            headerBuffer.flip()
 
-        val magic = ByteArray(4)
-        headerBuffer.get(magic)
-        if (!magic.contentEquals(CryptoEngine.SGV2_MAGIC)) throw IOException("Not an SGV2 format")
+            val magic = ByteArray(4)
+            headerBuffer.get(magic)
+            if (!magic.contentEquals(CryptoEngine.SGV2_MAGIC)) throw IOException("Not an SGV2 format")
 
-        val headerNonce = ByteArray(12)
-        headerBuffer.get(headerNonce)
-        val headerCipher = ByteArray(80)
-        headerBuffer.get(headerCipher)
+            val headerNonce = ByteArray(12)
+            headerBuffer.get(headerNonce)
+            val headerCipher = ByteArray(80)
+            headerBuffer.get(headerCipher)
 
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(128, headerNonce))
-        val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
-        val thumbLen = headerPlain.long
-        val screenLen = headerPlain.long
-        headerPlain.int // flags
-        headerPlain.int // width
-        headerPlain.int // height
-        headerPlain.long // storedOriginalSize
-        val liveVideoOffset = headerPlain.long
-        val liveVideoSize = headerPlain.long
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(dek, "AES"), GCMParameterSpec(128, headerNonce))
+            val headerPlain = ByteBuffer.wrap(cipher.doFinal(headerCipher))
+            val thumbLen = headerPlain.long
+            val screenLen = headerPlain.long
+            headerPlain.int // flags
+            headerPlain.int // width
+            headerPlain.int // height
+            headerPlain.long // storedOriginalSize
+            val liveVideoOffset = headerPlain.long
+            val liveVideoSize = headerPlain.long
 
-        offsetFull = 96L + thumbLen + screenLen
-        fullTierEncryptedSize = totalFileSize - offsetFull
+            offsetFull = 96L + thumbLen + screenLen
+            fullTierEncryptedSize = totalFileSize - offsetFull
 
-        // Đọc Nonce của Tier 3 tại offsetFull
-        val nonceBuffer = ByteBuffer.allocate(12)
-        fileChannel!!.read(nonceBuffer, offsetFull)
-        nonceBuffer.flip()
-        nonceBuffer.get(fileNonce)
+            if (fullTierEncryptedSize <= 12L) {
+                throw IOException("Empty or corrupt Tier 3 data in SGV2")
+            }
 
-        cachedBlockIndex = -1
-        cachedBlockData = null
+            // Đọc Nonce của Tier 3 tại offsetFull
+            val nonceBuffer = ByteBuffer.allocate(12)
+            channel.read(nonceBuffer, offsetFull)
+            nonceBuffer.flip()
+            nonceBuffer.get(fileNonce)
 
-        val totalDecryptedLength = CryptoEngine.getDecryptedLength(fullTierEncryptedSize)
+            cachedBlockIndex = -1
+            cachedBlockData = null
 
-        val streamLength: Long
-        if (isLivePhotoVideo && liveVideoOffset > 0L && liveVideoSize > 0L && liveVideoOffset < totalDecryptedLength) {
-            virtualBaseOffset = liveVideoOffset
-            streamLength = minOf(liveVideoSize, totalDecryptedLength - liveVideoOffset)
-        } else {
-            virtualBaseOffset = 0L
-            streamLength = totalDecryptedLength
+            val totalDecryptedLength = CryptoEngine.getDecryptedLength(fullTierEncryptedSize)
+
+            val streamLength: Long = if (isLivePhotoVideo && liveVideoOffset > 0L && liveVideoSize > 0L && liveVideoOffset < totalDecryptedLength) {
+                virtualBaseOffset = liveVideoOffset
+                minOf(liveVideoSize, totalDecryptedLength - liveVideoOffset)
+            } else {
+                virtualBaseOffset = 0L
+                totalDecryptedLength
+            }
+
+            currentPosition = dataSpec.position
+            bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+                dataSpec.length
+            } else {
+                (streamLength - currentPosition).coerceAtLeast(0L)
+            }
+
+            opened = true
+            transferStarted(dataSpec)
+            return bytesRemaining
+        } catch (e: Exception) {
+            closeInternal()
+            throw if (e is IOException) e else IOException("Failed to open SGV2 data source: ${e.message}", e)
         }
-
-        currentPosition = dataSpec.position
-        bytesRemaining = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-            dataSpec.length
-        } else {
-            (streamLength - currentPosition).coerceAtLeast(0L)
-        }
-
-        opened = true
-        transferStarted(dataSpec)
-        return bytesRemaining
     }
 
-    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int = synchronized(lock) {
         if (length == 0) return 0
-        if (bytesRemaining == 0L) return C.RESULT_END_OF_INPUT
+        if (bytesRemaining == 0L || !opened) return C.RESULT_END_OF_INPUT
 
+        val channel = fileChannel ?: return C.RESULT_END_OF_INPUT
         val toRead = minOf(length.toLong(), bytesRemaining).toInt()
         val absolutePlainPosition = virtualBaseOffset + currentPosition
         val blockIndex = absolutePlainPosition / 4096
@@ -123,7 +135,7 @@ class EncryptedDataSource(
         val blockRemaining = 4096 - blockOffset
         val bytesFromThisBlock = minOf(toRead, blockRemaining)
 
-        val decryptedBlock = getOrDecryptBlock(blockIndex)
+        val decryptedBlock = getOrDecryptBlock(channel, blockIndex)
         if (decryptedBlock == null || decryptedBlock.isEmpty()) return C.RESULT_END_OF_INPUT
 
         val actualToCopy = minOf(bytesFromThisBlock, decryptedBlock.size - blockOffset)
@@ -138,7 +150,7 @@ class EncryptedDataSource(
         return actualToCopy
     }
 
-    private fun getOrDecryptBlock(blockIndex: Long): ByteArray? {
+    private fun getOrDecryptBlock(channel: FileChannel, blockIndex: Long): ByteArray? {
         if (blockIndex == cachedBlockIndex && cachedBlockData != null) return cachedBlockData
 
         val encryptedBlockStart = offsetFull + 12 + blockIndex * 4112
@@ -150,8 +162,12 @@ class EncryptedDataSource(
         val byteBuffer = ByteBuffer.allocate(encryptedBlockSize.toInt())
         var bytesRead = 0
         while (bytesRead < encryptedBlockSize) {
-            val count = fileChannel!!.read(byteBuffer, encryptedBlockStart + bytesRead)
-            if (count == -1) break
+            val count = try {
+                channel.read(byteBuffer, encryptedBlockStart + bytesRead)
+            } catch (_: Exception) {
+                -1
+            }
+            if (count <= 0) break
             bytesRead += count
         }
 
@@ -165,24 +181,31 @@ class EncryptedDataSource(
             cachedBlockIndex = blockIndex
             cachedBlockData = decrypted
             decrypted
-        } catch (e: Exception) { null }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     override fun getUri(): Uri? = dataSpec?.uri
 
-    override fun close() {
+    private fun closeInternal() {
         if (opened) {
             opened = false
-            transferEnded()
+            try { transferEnded() } catch (_: Exception) {}
         }
-        try { pfd?.close() } catch (e: IOException) {}
-        finally {
-            pfd = null
-            fileChannel = null
-            cachedBlockIndex = -1
-            cachedBlockData = null
-            dataSpec = null
-            virtualBaseOffset = 0L
-        }
+        try { fileChannel?.close() } catch (_: Exception) {}
+        try { pfd?.close() } catch (_: Exception) {}
+        fileChannel = null
+        pfd = null
+        cachedBlockIndex = -1
+        cachedBlockData = null
+        dataSpec = null
+        virtualBaseOffset = 0L
+        currentPosition = 0L
+        bytesRemaining = 0L
+    }
+
+    override fun close(): Unit = synchronized(lock) {
+        closeInternal()
     }
 }

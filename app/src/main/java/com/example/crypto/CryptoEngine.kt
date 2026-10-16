@@ -10,7 +10,12 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import java.security.KeyStore
 import java.security.SecureRandom
+import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
@@ -102,6 +107,124 @@ object CryptoEngine {
 
     fun hasVaultConfig(context: Context, directoryUri: Uri): Boolean {
         return findChildUri(context, directoryUri, "vault.conf") != null
+    }
+
+    private const val BIOMETRIC_PREFS_NAME = "vault_biometric_prefs"
+    private const val BIOMETRIC_KEYSTORE_ALIAS = "secret_gallery_biometric_master_key"
+
+    private fun getOrCreateBiometricSecretKey(): SecretKey {
+        val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val existingKey = keyStore.getKey(BIOMETRIC_KEYSTORE_ALIAS, null) as? SecretKey
+        if (existingKey != null) return existingKey
+
+        val keyGenerator = KeyGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_AES,
+            "AndroidKeyStore"
+        )
+        val spec = KeyGenParameterSpec.Builder(
+            BIOMETRIC_KEYSTORE_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .build()
+        keyGenerator.init(spec)
+        return keyGenerator.generateKey()
+    }
+
+    private fun readVaultConfigSignature(context: Context, directoryUri: Uri): String? {
+        val vaultConfUri = findChildUri(context, directoryUri, "vault.conf") ?: return null
+        val jsonStr = context.contentResolver.openInputStream(vaultConfUri)?.use { input ->
+            input.readBytes().toString(Charsets.UTF_8)
+        } ?: return null
+        return try {
+            val json = JSONObject(jsonStr)
+            "${json.optString("salt")}:${json.optString("encryptedDek")}:${json.optString("dekIv")}"
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Mã hoá và lưu DEK của Vault bằng khoá phần cứng AndroidKeyStore để mở khoá bằng vân tay.
+     */
+    fun saveBiometricDek(context: Context, directoryUri: Uri, dek: ByteArray): Boolean {
+        return try {
+            val confSig = readVaultConfigSignature(context, directoryUri) ?: return false
+            val secretKey = getOrCreateBiometricSecretKey()
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val encryptedDek = cipher.doFinal(dek)
+            val iv = cipher.iv
+
+            val payload = JSONObject().apply {
+                put("encryptedDek", Base64.encodeToString(encryptedDek, Base64.NO_WRAP))
+                put("iv", Base64.encodeToString(iv, Base64.NO_WRAP))
+                put("confSig", confSig)
+            }
+
+            context.getSharedPreferences(BIOMETRIC_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(directoryUri.toString(), payload.toString())
+                .apply()
+            true
+        } catch (e: Exception) {
+            e.printStackTrace()
+            false
+        }
+    }
+
+    /**
+     * Kiểm tra xem Vault này đã có DEK được bảo vệ để mở khoá nhanh bằng vân tay hay chưa.
+     */
+    fun hasBiometricDek(context: Context, directoryUri: Uri): Boolean {
+        return try {
+            val raw = context.getSharedPreferences(BIOMETRIC_PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(directoryUri.toString(), null) ?: return false
+            val json = JSONObject(raw)
+            val savedSig = json.optString("confSig", "")
+            val currentSig = readVaultConfigSignature(context, directoryUri) ?: return false
+            savedSig.isNotEmpty() && savedSig == currentSig
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Giải mã DEK từ AndroidKeyStore sau khi người dùng xác thực vân tay thiết bị thành công.
+     */
+    fun unlockVaultWithBiometric(context: Context, directoryUri: Uri): ByteArray {
+        val prefs = context.getSharedPreferences(BIOMETRIC_PREFS_NAME, Context.MODE_PRIVATE)
+        val raw = prefs.getString(directoryUri.toString(), null)
+            ?: throw IllegalStateException("Fingerprint unlock is not set up for this vault yet. Please unlock with your Master Password once first.")
+
+        val json = JSONObject(raw)
+        val savedSig = json.optString("confSig", "")
+        val currentSig = readVaultConfigSignature(context, directoryUri)
+            ?: throw java.io.FileNotFoundException("vault.conf not found.")
+
+        if (savedSig.isEmpty() || savedSig != currentSig) {
+            clearBiometricDek(context, directoryUri)
+            throw IllegalStateException("Vault configuration changed. Please unlock with your Master Password once.")
+        }
+
+        val encryptedDek = Base64.decode(json.getString("encryptedDek"), Base64.NO_WRAP)
+        val iv = Base64.decode(json.getString("iv"), Base64.NO_WRAP)
+
+        val secretKey = getOrCreateBiometricSecretKey()
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(TAG_SIZE_BITS, iv))
+        return cipher.doFinal(encryptedDek)
+    }
+
+    fun clearBiometricDek(context: Context, directoryUri: Uri) {
+        try {
+            context.getSharedPreferences(BIOMETRIC_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(directoryUri.toString())
+                .apply()
+        } catch (_: Exception) {}
     }
 
     fun encryptFileName(name: String, dek: ByteArray): String {

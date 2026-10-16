@@ -752,6 +752,20 @@ class VaultViewModel : ViewModel() {
     private val _importProgress = MutableStateFlow(0f)
     val importProgress: StateFlow<Float> = _importProgress.asStateFlow()
 
+    private val _isProcessCompleted = MutableStateFlow(false)
+    val isProcessCompleted: StateFlow<Boolean> = _isProcessCompleted.asStateFlow()
+
+    /**
+     * Đảm bảo mọi vòng tiến trình đều chạy đầy 100%, sau đó hiển thị animation vẽ dấu tick
+     * hoàn tất rồi mới ẩn tiến trình đi.
+     */
+    private suspend fun playCompletionTickAnimation() {
+        _importProgress.value = 1f
+        kotlinx.coroutines.delay(240L)
+        _isProcessCompleted.value = true
+        kotlinx.coroutines.delay(480L)
+    }
+
     private val _importQueueTotal = MutableStateFlow(0)
     val importQueueTotal: StateFlow<Int> = _importQueueTotal.asStateFlow()
 
@@ -800,6 +814,16 @@ class VaultViewModel : ViewModel() {
     val animatingItem: StateFlow<String?> = _animatingItem.asStateFlow()
 
     fun updateThumbnailBounds(encryptedName: String, bounds: FloatArray) {
+        val current = _thumbnailBounds.value[encryptedName]
+        if (current != null &&
+            current.size == bounds.size &&
+            kotlin.math.abs(current[0] - bounds[0]) < 0.5f &&
+            kotlin.math.abs(current[1] - bounds[1]) < 0.5f &&
+            kotlin.math.abs(current[2] - bounds[2]) < 0.5f &&
+            kotlin.math.abs(current[3] - bounds[3]) < 0.5f
+        ) {
+            return
+        }
         _thumbnailBounds.value = _thumbnailBounds.value + (encryptedName to bounds)
     }
 
@@ -887,6 +911,10 @@ class VaultViewModel : ViewModel() {
 
     fun setVaultUri(context: Context, uri: Uri?) {
         gpsBackfillJob?.cancel()
+        com.example.ui.screens.ThumbBitmapCache.clear()
+        com.example.ui.screens.ScreenBitmapCache.clear()
+        com.example.ui.screens.FullBitmapCache.clear()
+        com.example.ui.screens.MediaPropertiesCache.clear()
         _dek.value?.fill(0)
         _dek.value = null
         _items.value = emptyList()
@@ -925,6 +953,8 @@ class VaultViewModel : ViewModel() {
         val updated = _savedVaults.value.filterNot { it == uri || it.toString() == targetStr }
         _savedVaults.value = updated
         saveVaultListToPrefs(context, updated)
+
+        CryptoEngine.clearBiometricDek(context, uri)
 
         // Thu hồi luôn quyền Persisted URI Permission của thư mục vừa xoá khỏi danh sách ghi nhớ
         try {
@@ -1265,10 +1295,13 @@ class VaultViewModel : ViewModel() {
         val uri = _vaultUri.value ?: return
         viewModelScope.launch {
             _isLoading.value = true
+            _importProgress.value = 0f
+            _isProcessCompleted.value = false
             _error.value = null
             try {
                 val unlockedData = withContext(Dispatchers.IO) {
                     val key = CryptoEngine.unlockVault(context, uri, password)
+                    CryptoEngine.saveBiometricDek(context, uri, key)
                     val scanned = scanFiles(context, uri, key)
                     val notes = loadMediaNotesFromDisk(context, uri, key)
                     val (gps, noGps) = loadMediaGpsFromDisk(context, uri, key)
@@ -1289,6 +1322,50 @@ class VaultViewModel : ViewModel() {
             } catch (e: Exception) {
                 _error.value = "Incorrect password."
             } finally {
+                _isProcessCompleted.value = false
+                _importProgress.value = 0f
+                _isLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Mở khoá Vault bằng vân tay của thiết bị (sau khi BiometricPrompt xác thực thành công).
+     */
+    fun unlockVaultWithBiometric(context: Context) {
+        val uri = _vaultUri.value ?: return
+        viewModelScope.launch {
+            _isLoading.value = true
+            _importProgress.value = 0f
+            _isProcessCompleted.value = false
+            _error.value = null
+            try {
+                val unlockedData = withContext(Dispatchers.IO) {
+                    val key = CryptoEngine.unlockVaultWithBiometric(context, uri)
+                    val scanned = scanFiles(context, uri, key)
+                    val notes = loadMediaNotesFromDisk(context, uri, key)
+                    val (gps, noGps) = loadMediaGpsFromDisk(context, uri, key)
+                    Triple(key, scanned, Triple(notes, gps, noGps))
+                }
+                val unlockedDek = unlockedData.first
+                val initialItems = unlockedData.second
+                val (notesMap, gpsMap, noGpsSet) = unlockedData.third
+
+                scannedNoGpsKeys.clear()
+                scannedNoGpsKeys.addAll(noGpsSet)
+                _mediaNotes.value = notesMap
+                _mediaGps.value = gpsMap
+                _items.value = initialItems
+                _dek.value = unlockedDek
+
+                startBackgroundGpsBackfill(context, uri, unlockedDek, initialItems)
+            } catch (e: IllegalStateException) {
+                _error.value = e.message ?: "Please unlock with your Master Password once to enable fingerprint unlock."
+            } catch (e: Exception) {
+                _error.value = "Fingerprint unlock failed. Please enter your Master Password."
+            } finally {
+                _isProcessCompleted.value = false
+                _importProgress.value = 0f
                 _isLoading.value = false
             }
         }
@@ -1298,13 +1375,19 @@ class VaultViewModel : ViewModel() {
         val uri = _vaultUri.value ?: return
         viewModelScope.launch {
             _isLoading.value = true
+            _importProgress.value = 0f
+            _isProcessCompleted.value = false
             _error.value = null
             try {
                 val (newDek, initialItems) = withContext(Dispatchers.IO) {
                     val key = CryptoEngine.initVault(context, uri, password)
+                    CryptoEngine.saveBiometricDek(context, uri, key)
                     val scanned = scanFiles(context, uri, key)
                     key to scanned
                 }
+
+                playCompletionTickAnimation()
+
                 scannedNoGpsKeys.clear()
                 _mediaNotes.value = emptyMap()
                 _mediaGps.value = emptyMap()
@@ -1313,6 +1396,8 @@ class VaultViewModel : ViewModel() {
             } catch (e: Exception) {
                 _error.value = "Failed to create Vault"
             } finally {
+                _isProcessCompleted.value = false
+                _importProgress.value = 0f
                 _isLoading.value = false
             }
         }
@@ -1321,6 +1406,10 @@ class VaultViewModel : ViewModel() {
     fun lockVault() {
         cancelImport()
         gpsBackfillJob?.cancel()
+        com.example.ui.screens.ThumbBitmapCache.clear()
+        com.example.ui.screens.ScreenBitmapCache.clear()
+        com.example.ui.screens.FullBitmapCache.clear()
+        com.example.ui.screens.MediaPropertiesCache.clear()
         _dek.value?.fill(0)
         _dek.value = null
         _vaultUri.value = null
@@ -1337,6 +1426,8 @@ class VaultViewModel : ViewModel() {
         val key = _dek.value ?: return
         viewModelScope.launch {
             _isLoading.value = true
+            _importProgress.value = 0f
+            _isProcessCompleted.value = false
             _error.value = null
             try {
                 val (scanned, notesMap, gpsPair) = withContext(Dispatchers.IO) {
@@ -1350,10 +1441,13 @@ class VaultViewModel : ViewModel() {
                 _mediaNotes.value = notesMap
                 _mediaGps.value = gpsPair.first
                 _items.value = scanned
+                playCompletionTickAnimation()
                 startBackgroundGpsBackfill(context, uri, key, scanned)
             } catch (e: Exception) {
                 _error.value = "Failed to load: ${e.message}"
             } finally {
+                _isProcessCompleted.value = false
+                _importProgress.value = 0f
                 _isLoading.value = false
             }
         }
@@ -1608,6 +1702,7 @@ class VaultViewModel : ViewModel() {
 
         _isLoading.value = true
         _importProgress.value = 0f
+        _isProcessCompleted.value = false
         _importQueueTotal.value = sourceUris.size
         _importQueueIndex.value = 0
         _currentImportThumb.value = null
@@ -1714,8 +1809,9 @@ class VaultViewModel : ViewModel() {
                 }
             }
 
-            // GIAI ĐOẠN 3: Rung 3 cái dài báo hiệu hoàn tất
+            // GIAI ĐOẠN 3: Rung 3 cái dài báo hiệu hoàn tất + Chờ tiến trình đạt 100% và vẽ dấu tick
             vibrateThreeTimes(context)
+            playCompletionTickAnimation()
         } catch (e: CancellationException) {
             withContext(NonCancellable + Dispatchers.IO) {
                 val snapshot = synchronized(createdVaultUris) { createdVaultUris.toList() }
@@ -1745,6 +1841,7 @@ class VaultViewModel : ViewModel() {
                 _currentImportIsLivePhoto.value = false
                 _isCancellingImport.value = false
                 isImportCancelled.set(false)
+                _isProcessCompleted.value = false
                 _isLoading.value = false
                 _importProgress.value = 0f
                 _importQueueTotal.value = 0
@@ -2807,9 +2904,15 @@ class VaultViewModel : ViewModel() {
         val vaultUriVal = _vaultUri.value
         val key = _dek.value
         viewModelScope.launch {
-            _isLoading.value = true; _error.value = null
+            _isLoading.value = true
+            _importProgress.value = 0f
+            _isProcessCompleted.value = false
+            _error.value = null
             try {
-                withContext(Dispatchers.IO) {
+                com.example.ui.screens.ThumbBitmapCache.remove(item.encryptedName)
+                com.example.ui.screens.ScreenBitmapCache.remove(item.encryptedName)
+                com.example.ui.screens.FullBitmapCache.remove(item.encryptedName)
+                val scanned = withContext(Dispatchers.IO) {
                     CryptoEngine.deleteFile(context, item.uri)
                     if (vaultUriVal != null && key != null) {
                         val updatedNotes = _mediaNotes.value.toMutableMap().apply { remove(item.encryptedName) }
@@ -2820,10 +2923,20 @@ class VaultViewModel : ViewModel() {
                         scannedNoGpsKeys.remove(item.encryptedName)
                         _mediaGps.value = updatedGps
                         persistMediaGpsLocked(context, vaultUriVal, key, updatedGps, scannedNoGpsKeys.toSet())
+                        scanFiles(context, vaultUriVal, key)
+                    } else {
+                        _items.value
                     }
                 }
-                _selectedMedia.value = null; loadVaultItems(context)
-            } catch (e: Exception) {} finally { _isLoading.value = false }
+                _items.value = scanned
+                _selectedMedia.value = null
+                playCompletionTickAnimation()
+            } catch (e: Exception) {
+            } finally {
+                _isProcessCompleted.value = false
+                _importProgress.value = 0f
+                _isLoading.value = false
+            }
         }
     }
 
@@ -2833,12 +2946,21 @@ class VaultViewModel : ViewModel() {
         val key = _dek.value
         viewModelScope.launch {
             _isLoading.value = true
+            _importProgress.value = 0f
+            _isProcessCompleted.value = false
             _error.value = null
             try {
-                withContext(Dispatchers.IO) {
+                val scanned = withContext(Dispatchers.IO) {
+                    val total = itemsToDelete.size.coerceAtLeast(1)
                     val deletedKeys = itemsToDelete.map { it.encryptedName }.toSet()
-                    itemsToDelete.forEach { item ->
+                    deletedKeys.forEach { k ->
+                        com.example.ui.screens.ThumbBitmapCache.remove(k)
+                        com.example.ui.screens.ScreenBitmapCache.remove(k)
+                        com.example.ui.screens.FullBitmapCache.remove(k)
+                    }
+                    itemsToDelete.forEachIndexed { idx, item ->
                         CryptoEngine.deleteFile(context, item.uri)
+                        _importProgress.value = (idx + 1f) / total
                     }
                     if (vaultUriVal != null && key != null) {
                         val updatedNotes = _mediaNotes.value.filterKeys { it !in deletedKeys }
@@ -2849,21 +2971,80 @@ class VaultViewModel : ViewModel() {
                         scannedNoGpsKeys.removeAll(deletedKeys)
                         _mediaGps.value = updatedGps
                         persistMediaGpsLocked(context, vaultUriVal, key, updatedGps, scannedNoGpsKeys.toSet())
+                        scanFiles(context, vaultUriVal, key)
+                    } else {
+                        _items.value
                     }
                 }
+                _items.value = scanned
                 _selectedMedia.value = null
-                loadVaultItems(context)
+                playCompletionTickAnimation()
                 onFinished?.invoke()
             } catch (e: Exception) {
                 _error.value = "Failed to delete selected files: ${e.message}"
             } finally {
+                _isProcessCompleted.value = false
+                _importProgress.value = 0f
                 _isLoading.value = false
             }
         }
     }
 
     /**
+     * Cấp phát tên file xuất ra duy nhất trong thư mục đích:
+     * Nếu có nhiều file trùng tên gốc (ví dụ cùng là "IMG_0001.JPG"), tự động đánh số
+     * "IMG_0001 (1).JPG", "IMG_0001 (2).JPG"... để đảm bảo xuất đủ 100% không bị ghi đè hay xoá mất.
+     */
+    private fun allocateUniqueExportFileName(
+        originalName: String,
+        usedNamesLower: MutableSet<String>
+    ): String {
+        val cleanName = originalName.trim().ifEmpty { "exported_media" }
+        if (usedNamesLower.add(cleanName.lowercase(Locale.ROOT))) {
+            return cleanName
+        }
+        val dotIndex = cleanName.lastIndexOf('.')
+        val baseName = if (dotIndex > 0) cleanName.substring(0, dotIndex) else cleanName
+        val extWithDot = if (dotIndex > 0) cleanName.substring(dotIndex) else ""
+
+        var counter = 1
+        while (true) {
+            val candidate = "$baseName ($counter)$extWithDot"
+            if (usedNamesLower.add(candidate.lowercase(Locale.ROOT))) {
+                return candidate
+            }
+            counter++
+        }
+    }
+
+    private fun queryExistingFileNamesLower(context: Context, directoryUri: Uri): MutableSet<String> {
+        val result = mutableSetOf<String>()
+        try {
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                directoryUri,
+                DocumentsContract.getTreeDocumentId(directoryUri)
+            )
+            context.contentResolver.query(
+                childrenUri,
+                arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val name = cursor.getString(0)
+                    if (!name.isNullOrEmpty()) {
+                        result.add(name.lowercase(Locale.ROOT))
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return result
+    }
+
+    /**
      * Giải mã và xuất (Export) các file ảnh/video gốc ra ngay bên trong thư mục Vault hiện tại.
+     * Đảm bảo xuất đủ 100% số file được chọn kể cả khi có nhiều file trùng tên nhau.
      */
     fun exportMultipleMedia(
         context: Context,
@@ -2882,6 +3063,7 @@ class VaultViewModel : ViewModel() {
         importJob = viewModelScope.launch {
             _isLoading.value = true
             _importProgress.value = 0f
+            _isProcessCompleted.value = false
             _importQueueTotal.value = itemsToExport.size
             _importQueueIndex.value = 0
             _currentImportThumb.value = null
@@ -2895,6 +3077,8 @@ class VaultViewModel : ViewModel() {
             try {
                 withContext(Dispatchers.IO) {
                     val totalFiles = itemsToExport.size.coerceAtLeast(1)
+                    val usedFileNamesLower = queryExistingFileNamesLower(context, vaultUriVal)
+
                     itemsToExport.forEachIndexed { index, item ->
                         if (isImportCancelled.get()) throw CancellationException("Export cancelled")
                         _importQueueIndex.value = index + 1
@@ -2922,18 +3106,15 @@ class VaultViewModel : ViewModel() {
                         }
 
                         val mimeType = resolveMimeTypeForFileName(item.originalName, item.isVideo)
-                        // Nếu trong thư mục Vault đã có sẵn file trùng tên gốc thì xoá file cũ trước để ghi bản mới sạch sẽ
-                        CryptoEngine.findChildUri(context, vaultUriVal, item.originalName)?.let { existingUri ->
-                            CryptoEngine.deleteFile(context, existingUri)
-                        }
+                        val uniqueExportName = allocateUniqueExportFileName(item.originalName, usedFileNamesLower)
 
-                        val destUri = CryptoEngine.createChildFile(context, vaultUriVal, item.originalName, mimeType)
-                            ?: CryptoEngine.createChildFile(context, vaultUriVal, item.originalName, "application/octet-stream")
-                            ?: throw java.io.IOException("Cannot create exported file: ${item.originalName}")
+                        val destUri = CryptoEngine.createChildFile(context, vaultUriVal, uniqueExportName, mimeType)
+                            ?: CryptoEngine.createChildFile(context, vaultUriVal, uniqueExportName, "application/octet-stream")
+                            ?: throw java.io.IOException("Cannot create exported file: $uniqueExportName")
 
                         createdExportUris.add(destUri)
 
-                        CryptoEngine.getSgv2TierStream(context, item.uri, CryptoEngine.Tier.FULL, key)?.use { plainStream ->
+                        val streamCopied = CryptoEngine.getSgv2TierStream(context, item.uri, CryptoEngine.Tier.FULL, key)?.use { plainStream ->
                             context.contentResolver.openOutputStream(destUri)?.use { outStream ->
                                 val buf = ByteArray(65536)
                                 var copied = 0L
@@ -2948,14 +3129,21 @@ class VaultViewModel : ViewModel() {
                                     }
                                 }
                                 outStream.flush()
-                            }
+                                true
+                            } ?: false
+                        } ?: false
+
+                        if (!streamCopied) {
+                            throw java.io.IOException("Failed to write exported data for $uniqueExportName")
                         }
+
                         exportedCount++
                         _importProgress.value = (index + 1f) / totalFiles
                     }
                 }
 
                 vibrateThreeTimes(context)
+                playCompletionTickAnimation()
                 Toast.makeText(
                     context,
                     "Exported $exportedCount original file(s) to Vault folder",
@@ -2979,6 +3167,7 @@ class VaultViewModel : ViewModel() {
                     _isCancellingImport.value = false
                     _isExporting.value = false
                     isImportCancelled.set(false)
+                    _isProcessCompleted.value = false
                     _isLoading.value = false
                     _importProgress.value = 0f
                     _importQueueTotal.value = 0

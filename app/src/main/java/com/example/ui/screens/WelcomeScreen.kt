@@ -1,7 +1,15 @@
 package com.example.ui.screens
 
+import android.content.Context
+import android.content.DialogInterface
+import android.hardware.biometrics.BiometricPrompt
 import android.net.Uri
+import android.os.Build
+import android.os.CancellationSignal
 import android.provider.DocumentsContract
+import androidx.core.content.ContextCompat
+import androidx.compose.ui.res.painterResource
+import com.example.R
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -49,9 +57,20 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathMeasure
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontFamily
@@ -103,6 +122,156 @@ private fun parseVaultDisplayInfo(uri: Uri): Pair<String, String> {
     return lastFolderName to displayPath
 }
 
+/**
+ * Kích hoạt cảm biến vân tay / sinh trắc học của thiết bị bằng BiometricPrompt gốc của Android SDK.
+ */
+private fun authenticateWithDeviceFingerprint(
+    context: Context,
+    folderName: String,
+    onAuthenticated: () -> Unit,
+    onError: (String) -> Unit
+) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+        onError("Fingerprint unlock requires Android 9 (API 28) or higher.")
+        return
+    }
+    try {
+        val executor = ContextCompat.getMainExecutor(context)
+        val cancellationSignal = CancellationSignal()
+        val prompt = BiometricPrompt.Builder(context)
+            .setTitle("Unlock Vault")
+            .setSubtitle(folderName)
+            .setDescription("Use your device fingerprint to unlock this vault")
+            .setNegativeButton(
+                "USE PASSWORD",
+                executor,
+                DialogInterface.OnClickListener { _, _ ->
+                    cancellationSignal.cancel()
+                }
+            )
+            .build()
+
+        prompt.authenticate(
+            cancellationSignal,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult?) {
+                    super.onAuthenticationSucceeded(result)
+                    onAuthenticated()
+                }
+
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
+                    super.onAuthenticationError(errorCode, errString)
+                    // Bỏ qua thông báo lỗi nếu người dùng chủ động bấm huỷ / bấm USE PASSWORD
+                    if (errorCode != BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED &&
+                        errorCode != BiometricPrompt.BIOMETRIC_ERROR_CANCELED &&
+                        !errString.isNullOrBlank()
+                    ) {
+                        onError(errString.toString())
+                    }
+                }
+            }
+        )
+    } catch (e: Exception) {
+        onError(e.message ?: "Unable to start fingerprint scanner.")
+    }
+}
+
+/**
+ * Vòng tròn tiến trình (Process Circle) tự động lấp đầy 100% và vẽ dấu tick animation trước khi ẩn.
+ */
+@Composable
+private fun AnimatedCircularProgressWithTick(
+    isCompletingOrCompleted: Boolean,
+    isTickVisible: Boolean,
+    color: Color,
+    trackColor: Color = color.copy(alpha = 0.24f),
+    size: Dp = 20.dp,
+    strokeWidth: Dp = 2.5.dp,
+    modifier: Modifier = Modifier
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "welcome_circle_spin")
+    val spinRotation by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "spin_angle"
+    )
+
+    val sweepProgress by animateFloatAsState(
+        targetValue = if (isCompletingOrCompleted) 1f else 0.28f,
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "circle_sweep_100"
+    )
+
+    val tickProgress by animateFloatAsState(
+        targetValue = if (isTickVisible) 1f else 0f,
+        animationSpec = if (isTickVisible) {
+            tween(durationMillis = 300, easing = FastOutSlowInEasing)
+        } else {
+            tween(durationMillis = 80)
+        },
+        label = "circle_tick_draw"
+    )
+
+    Canvas(modifier = modifier.size(size)) {
+        val strokePx = strokeWidth.toPx()
+        val diameter = this.size.minDimension - strokePx
+        val topLeftOffset = Offset((this.size.width - diameter) / 2f, (this.size.height - diameter) / 2f)
+        val arcSize = Size(diameter, diameter)
+
+        drawArc(
+            color = trackColor,
+            startAngle = 0f,
+            sweepAngle = 360f,
+            useCenter = false,
+            topLeft = topLeftOffset,
+            size = arcSize,
+            style = Stroke(width = strokePx, cap = StrokeCap.Round)
+        )
+
+        val startAngle = if (isCompletingOrCompleted) -90f else (spinRotation - 90f)
+        val sweepAngle = (sweepProgress * 360f).coerceIn(20f, 360f)
+
+        drawArc(
+            color = color,
+            startAngle = startAngle,
+            sweepAngle = sweepAngle,
+            useCenter = false,
+            topLeft = topLeftOffset,
+            size = arcSize,
+            style = Stroke(width = strokePx, cap = StrokeCap.Round)
+        )
+
+        if (tickProgress > 0.01f) {
+            val w = this.size.width
+            val h = this.size.height
+            val fullTickPath = Path().apply {
+                moveTo(w * 0.27f, h * 0.52f)
+                lineTo(w * 0.44f, h * 0.69f)
+                lineTo(w * 0.75f, h * 0.34f)
+            }
+            val pm = PathMeasure()
+            pm.setPath(fullTickPath, false)
+            val tickSegment = Path()
+            pm.getSegment(0f, pm.length * tickProgress.coerceIn(0f, 1f), tickSegment, true)
+
+            drawPath(
+                path = tickSegment,
+                color = color,
+                style = Stroke(
+                    width = strokePx,
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round
+                )
+            )
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun WelcomeScreen(
@@ -114,6 +283,8 @@ fun WelcomeScreen(
     val vaultUri by viewModel.vaultUri.collectAsState()
     val error by viewModel.error.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
+    val importProgress by viewModel.importProgress.collectAsState()
+    val isProcessCompleted by viewModel.isProcessCompleted.collectAsState()
 
     // State lưu Vault đang chờ xác nhận xoá khỏi danh sách ghi nhớ
     var vaultUriPendingRemoval by remember { mutableStateOf<Uri?>(null) }
@@ -482,16 +653,9 @@ fun WelcomeScreen(
                                         .testTag("select_vault_button")
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Filled.CreateNewFolder,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = "ADD / SELECT ANOTHER FOLDER",
-                                        fontWeight = FontWeight.Bold,
-                                        letterSpacing = 0.8.sp,
-                                        maxLines = 1
+                                        imageVector = Icons.Filled.Add,
+                                        contentDescription = "Add or Select Another Vault Folder",
+                                        modifier = Modifier.size(24.dp)
                                     )
                                 }
                             } else {
@@ -773,57 +937,115 @@ fun WelcomeScreen(
 
                             Spacer(modifier = Modifier.height(24.dp))
 
-                            Button(
-                                onClick = { submitAction() },
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(48.dp)
-                                    .testTag("unlock_create_button"),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.primary,
-                                    disabledContainerColor = if (isLoading) {
-                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
-                                    }
-                                ),
-                                enabled = !isLoading && password.isNotEmpty() && (isVaultConfigured || confirmPassword.isNotEmpty())
+                            val triggerFingerprintUnlock = {
+                                if (!isLoading) {
+                                    viewModel.clearError()
+                                    authenticateWithDeviceFingerprint(
+                                        context = context,
+                                        folderName = folderName,
+                                        onAuthenticated = {
+                                            if (CryptoEngine.hasBiometricDek(context, selectedUri)) {
+                                                viewModel.unlockVaultWithBiometric(context)
+                                            } else if (password.isNotEmpty()) {
+                                                viewModel.unlockVault(context, password)
+                                            } else {
+                                                viewModel.setError("Fingerprint verified! Please unlock with your Master Password once to enable fingerprint unlock for this vault.")
+                                            }
+                                        },
+                                        onError = { errMsg ->
+                                            viewModel.setError(errMsg)
+                                        }
+                                    )
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                AnimatedContent(
-                                    targetState = isLoading,
-                                    transitionSpec = {
-                                        (fadeIn(tween(180)) + scaleIn(initialScale = 0.92f, animationSpec = tween(180)))
-                                            .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.92f, animationSpec = tween(140)))
-                                    },
-                                    label = "unlock_button_loading_state"
-                                ) { loading ->
-                                    if (loading) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.Center
-                                        ) {
-                                            CircularProgressIndicator(
-                                                modifier = Modifier.size(20.dp),
-                                                color = MaterialTheme.colorScheme.onPrimary,
-                                                strokeWidth = 2.5.dp
-                                            )
-                                            Spacer(modifier = Modifier.width(10.dp))
+                                Button(
+                                    onClick = { submitAction() },
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("unlock_create_button"),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = MaterialTheme.colorScheme.primary,
+                                        disabledContainerColor = if (isLoading) {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                                        }
+                                    ),
+                                    enabled = !isLoading && password.isNotEmpty() && (isVaultConfigured || confirmPassword.isNotEmpty())
+                                ) {
+                                    AnimatedContent(
+                                        targetState = isLoading,
+                                        transitionSpec = {
+                                            (fadeIn(tween(180)) + scaleIn(initialScale = 0.92f, animationSpec = tween(180)))
+                                                .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.92f, animationSpec = tween(140)))
+                                        },
+                                        label = "unlock_button_loading_state"
+                                    ) { loading ->
+                                        if (loading) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.Center
+                                            ) {
+                                                AnimatedCircularProgressWithTick(
+                                                    isCompletingOrCompleted = importProgress >= 1f || isProcessCompleted,
+                                                    isTickVisible = isProcessCompleted,
+                                                    color = MaterialTheme.colorScheme.onPrimary,
+                                                    size = 20.dp,
+                                                    strokeWidth = 2.5.dp
+                                                )
+                                                Spacer(modifier = Modifier.width(10.dp))
+                                                Text(
+                                                    text = when {
+                                                        isProcessCompleted -> "UNLOCKED"
+                                                        isVaultConfigured -> "UNLOCKING VAULT..."
+                                                        else -> "INITIALIZING..."
+                                                    },
+                                                    fontWeight = FontWeight.Bold,
+                                                    letterSpacing = 1.sp,
+                                                    color = MaterialTheme.colorScheme.onPrimary,
+                                                    maxLines = 1
+                                                )
+                                            }
+                                        } else {
                                             Text(
-                                                text = if (isVaultConfigured) "UNLOCKING VAULT..." else "INITIALIZING...",
+                                                text = if (isVaultConfigured) "UNLOCK VAULT" else "INITIALIZE VAULT",
                                                 fontWeight = FontWeight.Bold,
                                                 letterSpacing = 1.sp,
                                                 color = MaterialTheme.colorScheme.onPrimary,
                                                 maxLines = 1
                                             )
                                         }
-                                    } else {
-                                        Text(
-                                            text = if (isVaultConfigured) "UNLOCK VAULT" else "INITIALIZE VAULT",
-                                            fontWeight = FontWeight.Bold,
-                                            letterSpacing = 1.sp,
-                                            color = MaterialTheme.colorScheme.onPrimary,
-                                            maxLines = 1
+                                    }
+                                }
+
+                                if (isVaultConfigured) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(48.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(
+                                                if (!isLoading) MaterialTheme.colorScheme.primary
+                                                else MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                                            )
+                                            .clickable(enabled = !isLoading) {
+                                                triggerFingerprintUnlock()
+                                            }
+                                            .testTag("fingerprint_unlock_button"),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            painter = painterResource(id = R.drawable.ic_fingerprint),
+                                            contentDescription = "Unlock Vault with Fingerprint",
+                                            tint = MaterialTheme.colorScheme.onPrimary,
+                                            modifier = Modifier.size(26.dp)
                                         )
                                     }
                                 }

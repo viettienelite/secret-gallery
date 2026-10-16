@@ -92,11 +92,13 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import android.util.LruCache
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableDoubleStateOf
 import androidx.compose.runtime.mutableFloatStateOf
@@ -196,46 +198,171 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
+/**
+ * Bộ nhớ đệm RAM (LruCache giới hạn theo KB thực tế) cho ảnh độ phân giải cao (Tier FULL).
+ * Giới hạn cạnh dài tối đa 3072px và dung lượng tối đa 1/8 Heap (<= 48MB) để chống tràn bộ nhớ (OOM)
+ * và tránh lỗi phần cứng "Canvas: trying to draw too large bitmap".
+ */
 object FullBitmapCache {
-    private const val MAX_ENTRIES = 4
-    private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
-        MAX_ENTRIES, 0.75f, true
-    ) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, androidx.compose.ui.graphics.ImageBitmap>?
-        ): Boolean = size > MAX_ENTRIES
+    private val maxCacheKb: Int = run {
+        val maxMemKb = (Runtime.getRuntime().maxMemory() / 1024L).toInt()
+        (maxMemKb / 8).coerceIn(16 * 1024, 48 * 1024)
+    }
+
+    private val cache = object : LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(maxCacheKb) {
+        override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
+            return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
+        }
     }
 
     @Synchronized
-    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache[key]
+    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache.get(key)
 
     @Synchronized
     fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
-        cache[key] = bitmap
+        cache.put(key, bitmap)
+    }
+
+    @Synchronized
+    fun remove(key: String) {
+        cache.remove(key)
+    }
+
+    @Synchronized
+    fun clear() {
+        cache.evictAll()
     }
 }
 
+/**
+ * Bộ nhớ đệm RAM (LruCache giới hạn theo KB thực tế) cho ảnh Tier SCREEN (1080p).
+ * Cho phép lưu ~12-20 ảnh 1080p đã giải mã sẵn trên RAM để vuốt ngang Pager và mở/đóng Sheet mượt 120fps.
+ */
 object ScreenBitmapCache {
-    private const val MAX_ENTRIES = 4
-    private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
-        MAX_ENTRIES, 0.75f, true
-    ) {
-        override fun removeEldestEntry(
-            eldest: MutableMap.MutableEntry<String, androidx.compose.ui.graphics.ImageBitmap>?
-        ): Boolean = size > MAX_ENTRIES
+    private val maxCacheKb: Int = run {
+        val maxMemKb = (Runtime.getRuntime().maxMemory() / 1024L).toInt()
+        (maxMemKb / 6).coerceIn(24 * 1024, 64 * 1024)
+    }
+
+    private val cache = object : LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(maxCacheKb) {
+        override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
+            return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
+        }
     }
 
     @Synchronized
-    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache[key]
+    fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache.get(key)
 
     @Synchronized
     fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
-        cache[key] = bitmap
+        cache.put(key, bitmap)
+    }
+
+    @Synchronized
+    fun remove(key: String) {
+        cache.remove(key)
+    }
+
+    @Synchronized
+    fun clear() {
+        cache.evictAll()
+    }
+}
+
+/**
+ * Cache thông tin thuộc tính của từng file (kích thước, dung lượng gốc, tên thiết bị chụp)
+ * giúp khi vuốt qua lại giữa các Sheet không phải đọc và giải mã lại từ đĩa.
+ */
+data class CachedMediaProperties(
+    val width: Int?,
+    val height: Int?,
+    val decryptedSize: Long?,
+    val deviceName: String?
+)
+
+object MediaPropertiesCache {
+    private val cache = object : LruCache<String, CachedMediaProperties>(256) {}
+
+    @Synchronized
+    fun get(key: String): CachedMediaProperties? = cache.get(key)
+
+    @Synchronized
+    fun put(key: String, info: CachedMediaProperties) {
+        cache.put(key, info)
+    }
+
+    @Synchronized
+    fun clear() {
+        cache.evictAll()
+    }
+}
+
+/**
+ * Giải mã ảnh Tier FULL với giới hạn cạnh dài an toàn (mặc định 3072px) để:
+ * 1. Không bao giờ vượt giới hạn 100MB của Android RecordingCanvas hay GL_MAX_TEXTURE_SIZE.
+ * 2. Không gây OutOfMemoryError khi gặp ảnh 48MP / 108MP / 200MP.
+ */
+private fun decodeBoundedFullBitmap(bytes: ByteArray, maxDimension: Int = 3072): Bitmap? {
+    if (bytes.isEmpty()) return null
+    return try {
+        val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+        val rawW = boundsOpts.outWidth
+        val rawH = boundsOpts.outHeight
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            try {
+                val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
+                return ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                    decoder.isMutableRequired = false
+                    val w = info.size.width
+                    val h = info.size.height
+                    val maxEdge = maxOf(w, h)
+                    if (maxEdge > maxDimension && maxEdge > 0) {
+                        val scale = maxDimension.toFloat() / maxEdge.toFloat()
+                        decoder.setTargetSize(
+                            (w * scale).toInt().coerceAtLeast(1),
+                            (h * scale).toInt().coerceAtLeast(1)
+                        )
+                    }
+                }
+            } catch (_: Throwable) {
+                // Fallback xuống BitmapFactory bên dưới
+            }
+        }
+
+        var sampleSize = 1
+        if (rawW > 0 && rawH > 0) {
+            while (maxOf(rawW / sampleSize, rawH / sampleSize) > maxDimension) {
+                sampleSize *= 2
+            }
+        }
+        val decodeOpts = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inJustDecodeBounds = false
+        }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
+    } catch (oom: OutOfMemoryError) {
+        FullBitmapCache.clear()
+        System.gc()
+        try {
+            val fallbackOpts = BitmapFactory.Options().apply {
+                inSampleSize = 4
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, fallbackOpts)
+        } catch (_: Throwable) {
+            null
+        }
+    } catch (_: Throwable) {
+        null
     }
 }
 
 object MapTileCache {
-    private const val MAX_TILES = 512
+    private const val MAX_TILES = 96
     private val cache = object : LinkedHashMap<String, androidx.compose.ui.graphics.ImageBitmap>(
         MAX_TILES, 0.75f, true
     ) {
@@ -272,6 +399,11 @@ object MapTileCache {
         cache[key] = bitmap
     }
 
+    @Synchronized
+    fun clear() {
+        cache.clear()
+    }
+
     fun markInFlight(key: String): Boolean = inFlight.add(key)
     fun unmarkInFlight(key: String) {
         inFlight.remove(key)
@@ -279,17 +411,14 @@ object MapTileCache {
 
     /**
      * Chuyển đổi ô bản đồ sáng sang giao diện Dark Mode sắc nét bằng ma trận đảo ngược độ sáng
-     * giữ nguyên sắc độ tự nhiên (Hue-Preserving Luminance Inversion):
-     * - Nền đất sáng chuyển thành xám than tối (#11151F)
-     * - Mặt nước vẫn giữ sắc xanh biển tối (#1E2F42)
-     * - Công viên giữ sắc xanh rêu tối
-     * - Chữ địa danh và tên đường nổi bật màu xám bạc sáng rõ nét
+     * giữ nguyên sắc độ tự nhiên (Hue-Preserving Luminance Inversion).
+     * Sử dụng RGB_565 vì ô bản đồ không có kênh trong suốt (alpha), giúp giảm 50% dung lượng RAM mỗi tile.
      */
     private fun convertLightTileToDarkBitmap(source: Bitmap): Bitmap {
         val out = Bitmap.createBitmap(
             source.width.coerceAtLeast(1),
             source.height.coerceAtLeast(1),
-            Bitmap.Config.ARGB_8888
+            Bitmap.Config.RGB_565
         )
         val canvas = android.graphics.Canvas(out)
         val darkMapMatrix = ColorMatrix(
@@ -317,9 +446,10 @@ object MapTileCache {
         if (diskFile != null && diskFile.exists() && diskFile.length() > 64L) {
             try {
                 val diskBytes = diskFile.readBytes()
-                val diskBmp = BitmapFactory.decodeByteArray(diskBytes, 0, diskBytes.size)?.asImageBitmap()
+                val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
+                val diskBmp = BitmapFactory.decodeByteArray(diskBytes, 0, diskBytes.size, opts)?.asImageBitmap()
                 if (diskBmp != null) return diskBmp
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
         }
 
         val serverIdx = (x + y) and 3
@@ -486,6 +616,11 @@ fun MediaViewerScreen(
         var dragX by remember { mutableFloatStateOf(0f) }
         var dragY by remember { mutableFloatStateOf(0f) }
 
+        // Lưu trạng thái zoom & pan hiện tại của ảnh để khi thu nhỏ về Grid sẽ thu mượt trực tiếp từ kích thước đang zoom (không bị nhảy cóc về 1x FULL)
+        var activeZoomScale by remember { mutableFloatStateOf(1f) }
+        var activeZoomOffsetX by remember { mutableFloatStateOf(0f) }
+        var activeZoomOffsetY by remember { mutableFloatStateOf(0f) }
+
         val initialIndex = remember(items, item) {
             items.indexOfFirst { it.encryptedName == item.encryptedName }.coerceAtLeast(0)
         }
@@ -515,10 +650,11 @@ fun MediaViewerScreen(
                     snapshotFlow { thumbReady }.first { it }
                 }
 
+                closeTransitionAlpha.snapTo(1f)
                 launch {
                     closeTransitionAlpha.animateTo(
                         targetValue = 0f,
-                        animationSpec = tween(durationMillis = 200)
+                        animationSpec = tween(durationMillis = 220)
                     )
                 }
 
@@ -534,6 +670,9 @@ fun MediaViewerScreen(
                 dragScale = 1f
                 dragX = 0f
                 dragY = 0f
+                activeZoomScale = 1f
+                activeZoomOffsetX = 0f
+                activeZoomOffsetY = 0f
 
                 keepPagerAlive = false
                 isClosing = false
@@ -544,13 +683,39 @@ fun MediaViewerScreen(
             }
         }
 
-        // Tải trước (Pre-warm) các ô bản đồ Dark quanh GPS của ảnh hiện tại ngay khi mở ảnh
+        // Tải trước (Pre-warm) ảnh Tier SCREEN (1080p) cho 2 trang lân cận (page - 1 và page + 1)
+        // sau khi Pager đã dừng vuốt để vuốt ngang sang ảnh kế tiếp mượt 120fps tức thì.
+        LaunchedEffect(pagerState.currentPage, pagerState.isScrollInProgress, dek, items) {
+            val key = dek ?: return@LaunchedEffect
+            if (pagerState.isScrollInProgress) return@LaunchedEffect
+            delay(80L)
+            val curPage = pagerState.currentPage
+            withContext(Dispatchers.IO) {
+                for (adjIdx in listOf(curPage + 1, curPage - 1)) {
+                    val adjItem = items.getOrNull(adjIdx) ?: continue
+                    if (ScreenBitmapCache.get(adjItem.encryptedName) != null) continue
+                    try {
+                        CryptoEngine.getSgv2TierStream(context, adjItem.uri, CryptoEngine.Tier.SCREEN, key)?.use { stream ->
+                            val bytes = stream.readBytes()
+                            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+                            if (bmp != null) {
+                                ScreenBitmapCache.put(adjItem.encryptedName, bmp)
+                            }
+                        }
+                    } catch (_: Throwable) {}
+                }
+            }
+        }
+
+        // Tải trước (Pre-warm) các ô bản đồ Dark quanh GPS của ảnh hiện tại (chỉ chạy sau khi dừng vuốt Pager)
         val activeItemGps = mediaGps[currentItem.encryptedName]
-        LaunchedEffect(currentItem.encryptedName, activeItemGps?.latitude, activeItemGps?.longitude) {
+        LaunchedEffect(currentItem.encryptedName, activeItemGps?.latitude, activeItemGps?.longitude, pagerState.isScrollInProgress) {
+            if (pagerState.isScrollInProgress) return@LaunchedEffect
+            delay(200L)
             MapTileCache.initDiskCache(context)
             val gps = activeItemGps ?: return@LaunchedEffect
             withContext(Dispatchers.IO) {
-                for (z in listOf(15, 16, 17)) {
+                for (z in listOf(15, 16)) {
                     val numTiles = 1 shl z
                     val cx = floor(lonToTileX(gps.longitude, z.toDouble())).toInt()
                     val cy = floor(latToTileY(gps.latitude, z.toDouble())).toInt()
@@ -781,6 +946,11 @@ fun MediaViewerScreen(
                 viewModel.selectMedia(activeItem)
                 viewModel.setAnimatingItem(activeItem.encryptedName)
             }
+            if (!isClosing) {
+                activeZoomScale = 1f
+                activeZoomOffsetX = 0f
+                activeZoomOffsetY = 0f
+            }
             pagerScrollEnabled = true
             isTouchingAnyInlineMap = false
         }
@@ -800,6 +970,9 @@ fun MediaViewerScreen(
             val activeKeys = items.map { it.encryptedName }.toSet()
             mediaGps.filterKeys { it in activeKeys }
         }
+        val allVaultGpsList = remember(allVaultGpsEntries) {
+            allVaultGpsEntries.values.toList()
+        }
         val currentGps = mediaGps[currentItem.encryptedName]
         val density = LocalDensity.current
         val focusManager = LocalFocusManager.current
@@ -811,8 +984,18 @@ fun MediaViewerScreen(
         ) {
             val sheetHeightPx = screenH * 0.60f
             val sheetHeightDp = with(density) { sheetHeightPx.toDp() }
-            val mediaUpwardShiftPx = -0.5f * sheetHeightPx * sheetProgress.value
-            val isInfoSheetOpen = showInfoDialog || sheetProgress.value > 0.005f
+            // Sử dụng derivedStateOf thay vì đọc trực tiếp sheetProgress.value ở thân Composable
+            // để tránh Recomposition toàn bộ MediaViewerScreen và 3 trang Pager ở mỗi frame (120fps) khi kéo/mở Sheet!
+            val isInfoSheetOpen by remember {
+                derivedStateOf { showInfoDialog || sheetProgress.value > 0.005f }
+            }
+            val isInfoSheetVisible by remember {
+                derivedStateOf { showInfoDialog || sheetProgress.value > 0.001f }
+            }
+            val isBottomNoteHiddenBySheet by remember {
+                derivedStateOf { showInfoDialog || sheetProgress.value >= 0.05f }
+            }
+            val isPagerScrolling = pagerState.isScrollInProgress
             var lastSheetDragDy by remember { mutableFloatStateOf(0f) }
 
             val handleSheetVerticalEnd: () -> Unit = {
@@ -848,17 +1031,17 @@ fun MediaViewerScreen(
                         state = pagerState,
                         userScrollEnabled = ((pagerScrollEnabled || isInfoSheetOpen) && !isTouchingAnyInlineMap) && showInteractiveViewer,
                         beyondViewportPageCount = 1,
-                        key = { page -> items[page].encryptedName },
+                        key = { page -> items.getOrNull(page)?.encryptedName ?: "empty_page_$page" },
                         modifier = Modifier.fillMaxSize()
                     ) { page ->
-                        val pageItem = items[page]
+                        val pageItem = items.getOrNull(page) ?: return@HorizontalPager
                         val isCurrentPage = page == pagerState.currentPage
 
                         val cachedThumb = remember(pageItem.encryptedName) {
                             ThumbBitmapCache.get(pageItem.encryptedName)
                         }
 
-                        val cachedScreen = remember(pageItem.encryptedName) {
+                        val cachedScreen = remember(pageItem.encryptedName, screenImageBitmapOwner, screenImageBitmap) {
                             ScreenBitmapCache.get(pageItem.encryptedName)
                         }
 
@@ -871,12 +1054,12 @@ fun MediaViewerScreen(
                         }
 
                         Box(modifier = Modifier.fillMaxSize()) {
-                            // Lớp 1: Ảnh / Video của trang này
+                            // Lớp 1: Ảnh / Video của trang này (đọc sheetProgress.value trong graphicsLayer để chạy 100% trên GPU RenderThread)
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
                                     .graphicsLayer {
-                                        translationY = mediaUpwardShiftPx
+                                        translationY = -0.5f * sheetHeightPx * sheetProgress.value
                                     },
                                 contentAlignment = Alignment.Center
                             ) {
@@ -887,6 +1070,7 @@ fun MediaViewerScreen(
                                             item = pageItem,
                                             dek = key,
                                             isActive = isCurrentPage && showInteractiveViewer,
+                                            isPagerScrolling = isPagerScrolling,
                                             isInteractive = showInteractiveViewer,
                                             showControls = showControls,
                                             isInfoSheetOpen = isInfoSheetOpen,
@@ -931,11 +1115,15 @@ fun MediaViewerScreen(
                                             imageLoader = loader,
                                             dek = key,
                                             isActivePage = isCurrentPage && showInteractiveViewer && !isClosing,
+                                            isPagerScrolling = isPagerScrolling,
                                             isInfoSheetOpen = isInfoSheetOpen,
                                             placeholderBitmap = bestPlaceholder,
                                             onDismissDragStart = { if (isCurrentPage) isHdrActive = false },
                                             onDismissDragCancel = { if (isCurrentPage) isHdrActive = true },
                                             onDismiss = { scaleVal, xVal, yVal ->
+                                                activeZoomScale = 1f
+                                                activeZoomOffsetX = 0f
+                                                activeZoomOffsetY = 0f
                                                 dragScale = scaleVal
                                                 dragX = xVal + (screenW / 2f) * (1f - scaleVal)
                                                 dragY = yVal + (screenH / 2f) * (1f - scaleVal)
@@ -944,6 +1132,13 @@ fun MediaViewerScreen(
                                             onScaleChanged = { scale ->
                                                 if (isCurrentPage) {
                                                     pagerScrollEnabled = scale <= 1.05f
+                                                }
+                                            },
+                                            onZoomTransformChanged = { zScale, zOffX, zOffY ->
+                                                if (isCurrentPage && !isClosing) {
+                                                    activeZoomScale = zScale
+                                                    activeZoomOffsetX = zOffX
+                                                    activeZoomOffsetY = zOffY
                                                 }
                                             },
                                             onTap = {
@@ -972,16 +1167,17 @@ fun MediaViewerScreen(
                             }
 
                             // Lớp 2: Bảng Properties Details RIÊNG của từng ảnh/video (nằm trực tiếp trong từng page của HorizontalPager)
-                            if ((showInfoDialog || sheetProgress.value > 0.001f) && showInteractiveViewer) {
+                            if (isInfoSheetVisible && showInteractiveViewer) {
                                 MediaPagePropertiesSheet(
                                     context = context,
                                     viewModel = viewModel,
                                     pageItem = pageItem,
                                     isCurrentPage = isCurrentPage,
+                                    isPagerScrolling = isPagerScrolling,
                                     dek = dek,
                                     savedNote = mediaNotes[pageItem.encryptedName] ?: "",
                                     pageGps = mediaGps[pageItem.encryptedName],
-                                    allVaultGps = allVaultGpsEntries.values.toList(),
+                                    allVaultGps = allVaultGpsList,
                                     sheetHeightPx = sheetHeightPx,
                                     sheetHeightDp = sheetHeightDp,
                                     sheetProgress = sheetProgress,
@@ -1006,11 +1202,24 @@ fun MediaViewerScreen(
                 }
             }
 
-            // LỚP VẼ CANVAS CHO ANIMATION
+            // LỚP VẼ CANVAS CHO ANIMATION (Thu nhỏ mượt trực tiếp từ kích thước & vị trí đang zoom về ô Grid)
             if (!showInteractiveViewer || isEntering) {
                 val currentTargetBounds = if (isEntering) startBounds else (boundsMap[currentItem.encryptedName] ?: startBounds)
                 val trStartLeft = currentTargetBounds[0]
                 val trStartTop = currentTargetBounds[1]
+                val trStartWidth = currentTargetBounds.getOrNull(2)?.takeIf { it > 0f } ?: startWidth
+                val trStartHeight = currentTargetBounds.getOrNull(3)?.takeIf { it > 0f } ?: startHeight
+
+                val dynamicTransitionShape = remember(trStartWidth, trStartHeight, screenW, screenH) {
+                    object : Shape {
+                        override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
+                            val t = progress.value
+                            val w = lerp(trStartWidth, screenW, t)
+                            val h = lerp(trStartHeight, screenH, t)
+                            return Outline.Rectangle(androidx.compose.ui.geometry.Rect(0f, 0f, w, h))
+                        }
+                    }
+                }
 
                 Box(
                     modifier = Modifier
@@ -1034,28 +1243,43 @@ fun MediaViewerScreen(
                                 transformOrigin = TransformOrigin(0f, 0f)
 
                                 clip = true
-                                shape = transitionShape
+                                shape = dynamicTransitionShape
                             }
                     ) {
+                        val fullCachedBitmap = remember(currentItem.encryptedName, showInteractiveViewer, isEntering) {
+                            if (!isEntering) FullBitmapCache.get(currentItem.encryptedName) else null
+                        }
+
                         Canvas(modifier = Modifier.fillMaxSize()) {
                             val t = progress.value
-                            val currentBoxW = lerp(startWidth, screenW, t)
-                            val currentBoxH = lerp(startHeight, screenH, t)
+                            val currentBoxW = lerp(trStartWidth, screenW, t)
+                            val currentBoxH = lerp(trStartHeight, screenH, t)
+
+                            val effZoomScale = if (isEntering) 1f else activeZoomScale
+                            val effZoomOffX = if (isEntering) 0f else activeZoomOffsetX
+                            val effZoomOffY = if (isEntering) 0f else activeZoomOffsetY
 
                             fun drawLayer(imgBmp: androidx.compose.ui.graphics.ImageBitmap, opacity: Float) {
                                 if (opacity <= 0f) return
                                 val srcW = imgBmp.width.toFloat()
                                 val srcH = imgBmp.height.toFloat()
                                 if (srcW > 0f && srcH > 0f) {
-                                    val coverScale = maxOf(startWidth / srcW, startHeight / srcH)
+                                    val coverScale = maxOf(trStartWidth / srcW, trStartHeight / srcH)
                                     val fitScale = minOf(screenW / srcW, screenH / srcH)
-                                    val curScale = lerp(coverScale, fitScale, t)
+                                    val baseScale = lerp(coverScale, fitScale, t)
+                                    val relZoom = lerp(1f, effZoomScale, t)
+                                    val curScale = baseScale * relZoom
 
                                     val curImgW = srcW * curScale
                                     val curImgH = srcH * curScale
 
-                                    val imgX = (currentBoxW - curImgW) / 2f
-                                    val imgY = (currentBoxH - curImgH) / 2f
+                                    val boxRatioX = (currentBoxW / screenW.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val boxRatioY = (currentBoxH / screenH.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val curOffsetX = effZoomOffX * t * boxRatioX
+                                    val curOffsetY = effZoomOffY * t * boxRatioY
+
+                                    val imgX = (currentBoxW - curImgW) / 2f + curOffsetX
+                                    val imgY = (currentBoxH - curImgH) / 2f + curOffsetY
 
                                     translate(imgX, imgY) {
                                         scale(curScale, curScale, pivot = Offset.Zero) {
@@ -1073,9 +1297,14 @@ fun MediaViewerScreen(
                                 drawLayer(thumbImageBitmap!!, 1f)
                             }
 
-                            if (screenImageBitmap != null) {
-                                val screenDrawAlpha = (screenImageAlpha.value * closeTransitionAlpha.value).coerceIn(0f, 1f)
-                                drawLayer(screenImageBitmap!!, screenDrawAlpha)
+                            val highResBitmap = fullCachedBitmap ?: screenImageBitmap
+                            if (highResBitmap != null) {
+                                val highResAlpha = if (fullCachedBitmap != null) {
+                                    closeTransitionAlpha.value.coerceIn(0f, 1f)
+                                } else {
+                                    (screenImageAlpha.value * closeTransitionAlpha.value).coerceIn(0f, 1f)
+                                }
+                                drawLayer(highResBitmap, highResAlpha)
                             }
                         }
                     }
@@ -1160,7 +1389,7 @@ fun MediaViewerScreen(
                 label = "note_bottom_space"
             )
             AnimatedVisibility(
-                visible = showInteractiveViewer && activeBottomNote.isNotEmpty() && !showInfoDialog && sheetProgress.value < 0.05f,
+                visible = showInteractiveViewer && activeBottomNote.isNotEmpty() && !isBottomNoteHiddenBySheet,
                 enter = fadeIn(tween(180)),
                 exit = fadeOut(tween(140)),
                 modifier = Modifier
@@ -1349,7 +1578,7 @@ fun MediaViewerScreen(
                 ) {
                     DetailsGpsHeatmapMap(
                         currentGps = currentGps,
-                        allVaultGps = allVaultGpsEntries.values.toList(),
+                        allVaultGps = allVaultGpsList,
                         isFullScreen = true,
                         controlsBottomPadding = controlsBottomOffsetDp,
                         onViewportChanged = { cLat, cLon, cZoom, cW, cH ->
@@ -1612,6 +1841,7 @@ private fun MediaPagePropertiesSheet(
     viewModel: VaultViewModel,
     pageItem: VaultItem,
     isCurrentPage: Boolean,
+    isPagerScrolling: Boolean = false,
     dek: ByteArray?,
     savedNote: String,
     pageGps: MediaGpsInfo?,
@@ -1628,11 +1858,15 @@ private fun MediaPagePropertiesSheet(
     val coroutineScope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
 
-    var imageWidth by remember(pageItem.encryptedName) { mutableStateOf<Int?>(null) }
-    var imageHeight by remember(pageItem.encryptedName) { mutableStateOf<Int?>(null) }
-    var decryptedSize by remember(pageItem.encryptedName) { mutableStateOf<Long?>(null) }
-    var deviceName by remember(pageItem.encryptedName) { mutableStateOf<String?>(null) }
-    var loadingInfo by remember(pageItem.encryptedName) { mutableStateOf(false) }
+    val cachedProps = remember(pageItem.encryptedName) {
+        MediaPropertiesCache.get(pageItem.encryptedName)
+    }
+
+    var imageWidth by remember(pageItem.encryptedName) { mutableStateOf(cachedProps?.width) }
+    var imageHeight by remember(pageItem.encryptedName) { mutableStateOf(cachedProps?.height) }
+    var decryptedSize by remember(pageItem.encryptedName) { mutableStateOf(cachedProps?.decryptedSize) }
+    var deviceName by remember(pageItem.encryptedName) { mutableStateOf(cachedProps?.deviceName) }
+    var loadingInfo by remember(pageItem.encryptedName) { mutableStateOf(cachedProps == null) }
 
     var noteDraft by remember(pageItem.encryptedName) { mutableStateOf(savedNote) }
 
@@ -1661,49 +1895,101 @@ private fun MediaPagePropertiesSheet(
         }
     }
 
+    // Bước 1: Đọc nhanh 96-byte SGV2 Header (< 0.3ms) để hiển thị ngay lập tức độ phân giải & dung lượng
     LaunchedEffect(pageItem.encryptedName, dek) {
         val key = dek ?: return@LaunchedEffect
-        viewModel.ensureMediaGpsLoaded(context, pageItem)
-        loadingInfo = true
+        if (imageWidth != null && imageHeight != null && decryptedSize != null) return@LaunchedEffect
         withContext(Dispatchers.IO) {
             try {
                 val info = CryptoEngine.readSgv2FileInfo(context, pageItem.uri, key)
                 if (info != null) {
-                    decryptedSize = info.decryptedSize
-                    if (info.width > 0 && info.height > 0) {
-                        imageWidth = info.width
-                        imageHeight = info.height
+                    withContext(Dispatchers.Main) {
+                        decryptedSize = info.decryptedSize
+                        if (info.width > 0 && info.height > 0) {
+                            imageWidth = info.width
+                            imageHeight = info.height
+                        }
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    // Bước 2: Chỉ giải mã EXIF/MP4 Device Name và truy vấn GPS cho trang HIỆN TẠI sau khi Pager đã dừng vuốt
+    // để không làm nghẽn CPU/IO khi người dùng đang vuốt ngang chuyển Sheet!
+    LaunchedEffect(pageItem.encryptedName, dek, isCurrentPage, isPagerScrolling) {
+        val key = dek ?: return@LaunchedEffect
+        if (!isCurrentPage || isPagerScrolling) return@LaunchedEffect
+        delay(100L)
+        viewModel.ensureMediaGpsLoaded(context, pageItem)
+
+        if (deviceName != null && imageWidth != null && imageHeight != null) {
+            loadingInfo = false
+            return@LaunchedEffect
+        }
+
+        loadingInfo = true
+        withContext(Dispatchers.IO) {
+            try {
+                var w = imageWidth
+                var h = imageHeight
+                var decSize = decryptedSize
+
+                if (w == null || h == null || decSize == null) {
+                    val info = CryptoEngine.readSgv2FileInfo(context, pageItem.uri, key)
+                    if (info != null) {
+                        decSize = info.decryptedSize
+                        if (info.width > 0 && info.height > 0) {
+                            w = info.width
+                            h = info.height
+                        }
                     }
                 }
 
-                if (imageWidth == null || imageHeight == null) {
+                if (w == null || h == null) {
                     val cachedFull = FullBitmapCache.get(pageItem.encryptedName)
                     if (cachedFull != null) {
-                        imageWidth = cachedFull.width
-                        imageHeight = cachedFull.height
+                        w = cachedFull.width
+                        h = cachedFull.height
                     } else if (!pageItem.isVideo) {
                         CryptoEngine.getSgv2TierStream(context, pageItem.uri, CryptoEngine.Tier.FULL, key)?.use { stream ->
                             val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                             BitmapFactory.decodeStream(stream, null, options)
                             if (options.outWidth > 0 && options.outHeight > 0) {
-                                imageWidth = options.outWidth
-                                imageHeight = options.outHeight
+                                w = options.outWidth
+                                h = options.outHeight
                             }
                         }
                     } else {
                         val cachedScreen = ScreenBitmapCache.get(pageItem.encryptedName)
                         if (cachedScreen != null) {
-                            imageWidth = cachedScreen.width
-                            imageHeight = cachedScreen.height
+                            w = cachedScreen.width
+                            h = cachedScreen.height
                         }
                     }
                 }
 
-                deviceName = extractDeviceNameFromVaultItem(context, pageItem, key)
-            } catch (e: Exception) {
+                val extractedDev = deviceName ?: extractDeviceNameFromVaultItem(context, pageItem, key)
+                val props = CachedMediaProperties(
+                    width = w,
+                    height = h,
+                    decryptedSize = decSize,
+                    deviceName = extractedDev
+                )
+                MediaPropertiesCache.put(pageItem.encryptedName, props)
+
+                withContext(Dispatchers.Main) {
+                    imageWidth = w
+                    imageHeight = h
+                    decryptedSize = decSize
+                    deviceName = extractedDev
+                }
+            } catch (e: Throwable) {
                 e.printStackTrace()
             } finally {
-                loadingInfo = false
+                withContext(Dispatchers.Main) {
+                    loadingInfo = false
+                }
             }
         }
     }
@@ -2035,6 +2321,7 @@ private fun MediaPagePropertiesSheet(
                 DetailsGpsHeatmapMap(
                     currentGps = pageGps,
                     allVaultGps = allVaultGps,
+                    isMapActive = isCurrentPage && !isPagerScrolling,
                     onMapTouchChanged = { touching ->
                         isTouchingInlineMap = touching
                         onInlineMapTouchChanged(touching)
@@ -2058,12 +2345,14 @@ fun EncryptedImageViewer(
     imageLoader: ImageLoader,
     dek: ByteArray,
     isActivePage: Boolean = false,
+    isPagerScrolling: Boolean = false,
     isInfoSheetOpen: Boolean = false,
     placeholderBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
     onDismiss: (scale: Float, x: Float, y: Float) -> Unit,
     onDismissDragStart: () -> Unit = {},
     onDismissDragCancel: () -> Unit = {},
     onScaleChanged: (Float) -> Unit,
+    onZoomTransformChanged: (scale: Float, offsetX: Float, offsetY: Float) -> Unit = { _, _, _ -> },
     onTap: () -> Unit,
     onSwipeUpDelta: (Float) -> Unit = {},
     onSwipeUpEnd: () -> Unit = {},
@@ -2074,11 +2363,18 @@ fun EncryptedImageViewer(
     val offsetX = remember { Animatable(0f) }
     val offsetY = remember { Animatable(0f) }
     val backgroundDimAlpha = remember { Animatable(1f) }
+    var isDraggingToDismissState by remember { mutableStateOf(false) }
 
     val displayMetrics = context.resources.displayMetrics
     val screenH = displayMetrics.heightPixels.toFloat()
 
     LaunchedEffect(scale.value) { onScaleChanged(scale.value) }
+
+    LaunchedEffect(scale.value, offsetX.value, offsetY.value, isActivePage, isDraggingToDismissState) {
+        if (isActivePage && !isDraggingToDismissState) {
+            onZoomTransformChanged(scale.value, offsetX.value, offsetY.value)
+        }
+    }
 
     // Khi mở bảng Properties, tự động đưa tỉ lệ phóng về 1x để cho phép vuốt ngang sang ảnh bên cạnh mượt mà
     LaunchedEffect(isInfoSheetOpen) {
@@ -2107,9 +2403,13 @@ fun EncryptedImageViewer(
         if (!isActivePage) {
             isPlayingLivePhoto = false
             isLiveVideoRendered = false
-            liveExoPlayer?.playWhenReady = false
-            liveExoPlayer?.pause()
-            liveExoPlayer?.clearVideoSurface()
+            liveExoPlayer?.let { p ->
+                p.playWhenReady = false
+                p.stop()
+                p.clearVideoSurface()
+                p.release()
+            }
+            liveExoPlayer = null
         }
     }
 
@@ -2168,16 +2468,21 @@ fun EncryptedImageViewer(
         label = "live_photo_video_crossfade"
     )
 
-    LaunchedEffect(item.encryptedName, dek) {
+    // Chỉ giải mã ảnh Tier FULL (độ phân giải cao phục vụ Zoom) cho TRANG ĐANG HIỂN THỊ
+    // và SAU KHI Pager đã dừng vuốt hoàn toàn -> Tránh nghẽn CPU/GC khi đang vuốt chuyển ảnh/Sheet!
+    LaunchedEffect(item.encryptedName, dek, isActivePage, isPagerScrolling) {
         val cachedFull = FullBitmapCache.get(item.encryptedName)
         if (cachedFull != null) {
             fullBitmap = cachedFull
             return@LaunchedEffect
         }
 
+        if (!isActivePage || isPagerScrolling) return@LaunchedEffect
+        delay(160L)
+
         withContext(Dispatchers.IO) {
             var attempt = 0
-            val maxAttempts = 3
+            val maxAttempts = 2
             var succeeded = false
             while (!succeeded && attempt < maxAttempts) {
                 attempt++
@@ -2190,7 +2495,7 @@ fun EncryptedImageViewer(
                     CryptoEngine.getSgv2TierStream(context, item.uri, CryptoEngine.Tier.FULL, dek)?.use { stream ->
                         val bytes = if (maxImageBytes > 0) {
                             val baos = ByteArrayOutputStream(maxImageBytes)
-                            val buf = ByteArray(8192)
+                            val buf = ByteArray(16384)
                             var remaining = maxImageBytes
                             while (remaining > 0) {
                                 val r = stream.read(buf, 0, minOf(buf.size, remaining))
@@ -2203,27 +2508,7 @@ fun EncryptedImageViewer(
                             stream.readBytes()
                         }
 
-                        val finalBmp = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
-                            try {
-                                val source = ImageDecoder.createSource(ByteBuffer.wrap(bytes))
-                                ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
-                                    decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
-                                    decoder.isMutableRequired = false
-                                }
-                            } catch (e: Exception) {
-                                val options = BitmapFactory.Options().apply {
-                                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                                    inJustDecodeBounds = false
-                                }
-                                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                            }
-                        } else {
-                            val options = BitmapFactory.Options().apply {
-                                inPreferredConfig = Bitmap.Config.ARGB_8888
-                                inJustDecodeBounds = false
-                            }
-                            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
-                        }
+                        val finalBmp = decodeBoundedFullBitmap(bytes, maxDimension = 3072)
                         if (finalBmp != null) {
                             val imgBmp = finalBmp.asImageBitmap()
                             FullBitmapCache.put(item.encryptedName, imgBmp)
@@ -2233,7 +2518,11 @@ fun EncryptedImageViewer(
                             succeeded = true
                         }
                     }
-                } catch (e: Exception) {
+                } catch (oom: OutOfMemoryError) {
+                    FullBitmapCache.clear()
+                    System.gc()
+                    break
+                } catch (e: Throwable) {
                     e.printStackTrace()
                 }
                 if (!succeeded && attempt < maxAttempts) {
@@ -2422,6 +2711,7 @@ fun EncryptedImageViewer(
                                     isLiveVideoRendered = false
                                     if (!isDraggingToDismiss) onDismissDragStart()
                                     isDraggingToDismiss = true
+                                    isDraggingToDismissState = true
 
                                     gestureOffsetY += delta.y
                                     gestureOffsetX += delta.x
@@ -2470,6 +2760,7 @@ fun EncryptedImageViewer(
                         if (offsetY.value > dismissThreshold) {
                             onDismiss(scale.value, offsetX.value, offsetY.value)
                         } else {
+                            isDraggingToDismissState = false
                             onDismissDragCancel()
                             coroutineScope.launch { offsetX.animateTo(0f, spring()) }
                             coroutineScope.launch { offsetY.animateTo(0f, spring()) }
@@ -2495,49 +2786,79 @@ fun EncryptedImageViewer(
             contentAlignment = Alignment.Center
         ) {
             val screenTierAlpha = 1f - fullImageAlpha.value
-            val tierScreenUri = remember(item.uri) {
-                item.uri.buildUpon().appendQueryParameter("tier", "SCREEN").build()
+            val cachedScreenBmp = remember(item.encryptedName, placeholderBitmap) {
+                ScreenBitmapCache.get(item.encryptedName)
             }
-            val painter = rememberAsyncImagePainter(
-                model = ImageRequest.Builder(context)
-                    .data(tierScreenUri)
-                    .build(),
-                imageLoader = imageLoader
-            )
-            val painterState = painter.state
 
-            if (painterState is coil.compose.AsyncImagePainter.State.Success) {
-                Image(
-                    painter = painter,
-                    contentDescription = item.originalName,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer(
-                            scaleX = scale.value,
-                            scaleY = scale.value,
-                            translationX = offsetX.value,
-                            translationY = offsetY.value,
-                            alpha = screenTierAlpha
-                        )
-                        .testTag("encrypted_image"),
-                    contentScale = ContentScale.Fit
+            if (cachedScreenBmp != null) {
+                if (screenTierAlpha > 0.001f || fullBitmap == null) {
+                    Image(
+                        bitmap = cachedScreenBmp,
+                        contentDescription = item.originalName,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer(
+                                scaleX = scale.value,
+                                scaleY = scale.value,
+                                translationX = offsetX.value,
+                                translationY = offsetY.value,
+                                alpha = if (fullBitmap != null) screenTierAlpha else 1f
+                            )
+                            .testTag("encrypted_image"),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            } else {
+                val tierScreenUri = remember(item.uri) {
+                    item.uri.buildUpon().appendQueryParameter("tier", "SCREEN").build()
+                }
+                val painter = rememberAsyncImagePainter(
+                    model = ImageRequest.Builder(context)
+                        .data(tierScreenUri)
+                        .build(),
+                    imageLoader = imageLoader
                 )
-            } else if (placeholderBitmap != null) {
-                Image(
-                    bitmap = placeholderBitmap,
-                    contentDescription = item.originalName,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer(
-                            scaleX = scale.value,
-                            scaleY = scale.value,
-                            translationX = offsetX.value,
-                            translationY = offsetY.value,
-                            alpha = screenTierAlpha
-                        )
-                        .testTag("encrypted_image"),
-                    contentScale = ContentScale.Fit
-                )
+                val painterState = painter.state
+
+                LaunchedEffect(item.encryptedName, painterState) {
+                    val success = painterState as? coil.compose.AsyncImagePainter.State.Success ?: return@LaunchedEffect
+                    val bmp = (success.result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap ?: return@LaunchedEffect
+                    ScreenBitmapCache.put(item.encryptedName, bmp.asImageBitmap())
+                }
+
+                if (painterState is coil.compose.AsyncImagePainter.State.Success) {
+                    Image(
+                        painter = painter,
+                        contentDescription = item.originalName,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer(
+                                scaleX = scale.value,
+                                scaleY = scale.value,
+                                translationX = offsetX.value,
+                                translationY = offsetY.value,
+                                alpha = if (fullBitmap != null) screenTierAlpha else 1f
+                            )
+                            .testTag("encrypted_image"),
+                        contentScale = ContentScale.Fit
+                    )
+                } else if (placeholderBitmap != null) {
+                    Image(
+                        bitmap = placeholderBitmap,
+                        contentDescription = item.originalName,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer(
+                                scaleX = scale.value,
+                                scaleY = scale.value,
+                                translationX = offsetX.value,
+                                translationY = offsetY.value,
+                                alpha = if (fullBitmap != null) screenTierAlpha else 1f
+                            )
+                            .testTag("encrypted_image"),
+                        contentScale = ContentScale.Fit
+                    )
+                }
             }
 
             val currentFullBitmap = fullBitmap
@@ -2644,6 +2965,7 @@ fun EncryptedVideoPlayer(
     item: VaultItem,
     dek: ByteArray,
     isActive: Boolean,
+    isPagerScrolling: Boolean = false,
     isInteractive: Boolean,
     showControls: Boolean,
     isInfoSheetOpen: Boolean = false,
@@ -2658,8 +2980,23 @@ fun EncryptedVideoPlayer(
 ) {
     var isVideoReady by remember { mutableStateOf(false) }
     var exoPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var duration by remember { mutableStateOf(0L) }
+    var currentPosition by remember { mutableStateOf(0L) }
+
     var localScreenBitmap by remember(item.encryptedName) {
         mutableStateOf(ScreenBitmapCache.get(item.encryptedName))
+    }
+
+    val effectivePlaceholder = localScreenBitmap ?: placeholderBitmap
+
+    // Kích thước chuẩn của video: khởi tạo ngay từ ảnh bìa SCREEN để TextureView khoá đúng tỉ lệ khung hình (16:9 / 9:16)
+    // ngay từ frame 0, triệt tiêu 100% hiện tượng nháy 1 frame bị kéo dãn méo toàn màn hình!
+    var videoWidth by remember(item.encryptedName) {
+        mutableIntStateOf(effectivePlaceholder?.width ?: 0)
+    }
+    var videoHeight by remember(item.encryptedName) {
+        mutableIntStateOf(effectivePlaceholder?.height ?: 0)
     }
 
     LaunchedEffect(item.encryptedName, dek) {
@@ -2673,54 +3010,103 @@ fun EncryptedVideoPlayer(
                         ScreenBitmapCache.put(item.encryptedName, bmp)
                         withContext(Dispatchers.Main) {
                             localScreenBitmap = bmp
+                            if (videoWidth <= 0 || videoHeight <= 0) {
+                                videoWidth = bmp.width
+                                videoHeight = bmp.height
+                            }
                         }
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
         }
     }
 
-    LaunchedEffect(isActive) {
-        if (isActive) {
+    // Khắc phục triệt để Crash & Lag khi vuốt liên tục giữa 2 Video:
+    // 1. Khi đang vuốt (isPagerScrolling == true) hoặc không active (isActive == false):
+    //    GIẢI PHÓNG NGAY LẬP TỨC (release) ExoPlayer và MediaCodec hardware decoder của video trước đó.
+    // 2. Chỉ khởi tạo duy nhất 1 ExoPlayer cho trang hiện tại SAU KHI DỪNG VUỐT (debounce 140ms).
+    LaunchedEffect(isActive, isPagerScrolling) {
+        if (isActive && !isPagerScrolling) {
+            delay(140L)
             if (exoPlayer == null) {
-                exoPlayer = ExoPlayer.Builder(context).build().apply {
-                    val mediaSource = ProgressiveMediaSource.Factory(
-                        EncryptedDataSourceFactory(context, dek)
-                    ).createMediaSource(MediaItem.fromUri(item.uri))
-                    setMediaSource(mediaSource)
-                    prepare()
-                    addListener(object : Player.Listener {
-                        override fun onRenderedFirstFrame() {
-                            isVideoReady = true
-                            onVideoReady()
-                        }
-                    })
+                try {
+                    val player = ExoPlayer.Builder(context).build().apply {
+                        val mediaSource = ProgressiveMediaSource.Factory(
+                            EncryptedDataSourceFactory(context, dek)
+                        ).createMediaSource(MediaItem.fromUri(item.uri))
+                        setMediaSource(mediaSource)
+                        playWhenReady = true
+                        prepare()
+                        addListener(object : Player.Listener {
+                            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                                if (videoSize.width > 0 && videoSize.height > 0) {
+                                    val par = if (videoSize.pixelWidthHeightRatio > 0f) videoSize.pixelWidthHeightRatio else 1f
+                                    videoWidth = (videoSize.width * par).toInt()
+                                    videoHeight = videoSize.height
+                                }
+                            }
+                            override fun onRenderedFirstFrame() {
+                                isVideoReady = true
+                                onVideoReady()
+                            }
+                            override fun onIsPlayingChanged(playing: Boolean) {
+                                isPlaying = playing
+                            }
+                            override fun onPlaybackStateChanged(playbackState: Int) {
+                                val d = this@apply.duration
+                                if (d > 0L) duration = d
+                                currentPosition = this@apply.currentPosition.coerceAtLeast(0L)
+                            }
+                            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                                error.printStackTrace()
+                            }
+                        })
+                    }
+                    exoPlayer = player
+                } catch (e: Throwable) {
+                    e.printStackTrace()
                 }
+            } else {
+                exoPlayer?.playWhenReady = true
             }
-            exoPlayer?.playWhenReady = true
         } else {
-            exoPlayer?.playWhenReady = false
-            exoPlayer?.pause()
+            isVideoReady = false
+            isPlaying = false
+            exoPlayer?.let { p ->
+                p.playWhenReady = false
+                p.stop()
+                p.clearVideoSurface()
+                p.release()
+            }
+            exoPlayer = null
         }
     }
 
     DisposableEffect(item.uri) {
         onDispose {
-            exoPlayer?.release()
+            isVideoReady = false
+            isPlaying = false
+            exoPlayer?.let { p ->
+                p.playWhenReady = false
+                p.stop()
+                p.clearVideoSurface()
+                p.release()
+            }
             exoPlayer = null
         }
     }
 
-    var isPlaying by remember { mutableStateOf(false) }
-    var duration by remember { mutableStateOf(0L) }
-    var currentPosition by remember { mutableStateOf(0L) }
-
-    LaunchedEffect(exoPlayer) {
-        while (exoPlayer != null) {
-            currentPosition = exoPlayer!!.currentPosition
-            duration = exoPlayer!!.duration.coerceAtLeast(0L)
-            isPlaying = exoPlayer!!.isPlaying
-            delay(250)
+    // Chỉ cập nhật position khi đang phát (isPlaying) VÀ đang hiện controls để không gây lãng phí CPU / recomposition
+    LaunchedEffect(isPlaying, showControls) {
+        if (isPlaying && showControls) {
+            while (true) {
+                exoPlayer?.let { p ->
+                    currentPosition = p.currentPosition.coerceAtLeast(0L)
+                    val d = p.duration
+                    if (d > 0L) duration = d
+                }
+                delay(250L)
+            }
         }
     }
 
@@ -2829,28 +3215,8 @@ fun EncryptedVideoPlayer(
             modifier = Modifier.fillMaxSize(),
             contentAlignment = Alignment.Center
         ) {
-            if (isInteractive && exoPlayer != null) {
-                AndroidView(
-                    factory = { ctx ->
-                        PlayerView(ctx).apply {
-                            useController = false
-                            player = exoPlayer
-                        }
-                    },
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer(
-                            scaleX = scale.value,
-                            scaleY = scale.value,
-                            translationX = offsetX.value,
-                            translationY = offsetY.value
-                        )
-                        .testTag("exoplayer_surface_view")
-                )
-            }
-
-            val effectivePlaceholder = localScreenBitmap ?: placeholderBitmap
-            if ((!isVideoReady || exoPlayer == null) && effectivePlaceholder != null) {
+            // Hiển thị ảnh bìa SCREEN ở đúng tỉ lệ Fit chuẩn: luôn luôn hiển thị ổn định cho tới khi frame video đầu tiên đã sẵn sàng
+            if (effectivePlaceholder != null && (!isVideoReady || exoPlayer == null)) {
                 Image(
                     bitmap = effectivePlaceholder,
                     contentDescription = null,
@@ -2863,6 +3229,44 @@ fun EncryptedVideoPlayer(
                             translationY = offsetY.value
                         ),
                     contentScale = ContentScale.Fit
+                )
+            }
+
+            // Dùng TextureView với applyCenterFitMatrix thay vì PlayerView:
+            // 1. applyCenterFitMatrix tính toán ngay tỉ lệ Fit từ videoWidth/videoHeight (hoặc placeholder) trước khi vẽ.
+            // 2. Alpha của TextureView chỉ bật lên 1f khi isVideoReady == true -> KHÔNG BAO GIỜ bị nháy 1 frame méo full màn hình!
+            if (isInteractive && exoPlayer != null) {
+                val effW = if (videoWidth > 0) videoWidth else effectivePlaceholder?.width ?: 0
+                val effH = if (videoHeight > 0) videoHeight else effectivePlaceholder?.height ?: 0
+
+                AndroidView(
+                    factory = { ctx ->
+                        TextureView(ctx).apply {
+                            isOpaque = false
+                            applyCenterFitMatrix(this, effW, effH)
+                            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                                applyCenterFitMatrix(this, effW, effH)
+                            }
+                            exoPlayer?.setVideoTextureView(this)
+                        }
+                    },
+                    update = { textureView ->
+                        exoPlayer?.setVideoTextureView(textureView)
+                        applyCenterFitMatrix(textureView, effW, effH)
+                    },
+                    onRelease = { textureView ->
+                        exoPlayer?.clearVideoTextureView(textureView)
+                    },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = scale.value,
+                            scaleY = scale.value,
+                            translationX = offsetX.value,
+                            translationY = offsetY.value,
+                            alpha = if (isVideoReady) 1f else 0f
+                        )
+                        .testTag("exoplayer_surface_view")
                 )
             }
 
@@ -3708,6 +4112,7 @@ private fun parseBinaryTiffMakeModel(bytes: ByteArray): String? {
 fun DetailsGpsHeatmapMap(
     currentGps: MediaGpsInfo?,
     allVaultGps: List<MediaGpsInfo>,
+    isMapActive: Boolean = true,
     onMapTouchChanged: (Boolean) -> Unit = {},
     isFullScreen: Boolean = false,
     controlsBottomPadding: Dp = 0.dp,
@@ -3766,8 +4171,9 @@ fun DetailsGpsHeatmapMap(
         }
     }
 
-    // Chủ động tải trước (Prefetch) cả mức zoom hiện tại (zInt) LẪN 2 mức zoom lân cận (zInt + 1 và zInt - 1)
-    LaunchedEffect(centerLat, centerLon, zoom, retryWave) {
+    // Chủ động tải trước (Prefetch) chỉ khi bản đồ của trang hiện tại đang active (không chạy trên trang lân cận khi đang vuốt Pager)
+    LaunchedEffect(centerLat, centerLon, zoom, retryWave, isMapActive) {
+        if (!isMapActive) return@LaunchedEffect
         val zInt = zoom.toInt().coerceIn(2, maxTileZoom)
         val numTiles = 1 shl zInt
         val cx = floor(lonToTileX(centerLon, zInt.toDouble())).toInt()
@@ -3961,7 +4367,7 @@ fun DetailsGpsHeatmapMap(
                             scale(drawScale, drawScale, pivot = Offset.Zero) {
                                 drawImage(
                                     image = cachedBmp,
-                                    filterQuality = FilterQuality.High
+                                    filterQuality = if (isMapActive) FilterQuality.Medium else FilterQuality.Low
                                 )
                             }
                         }
@@ -4022,7 +4428,9 @@ fun DetailsGpsHeatmapMap(
                             }
                         }
 
-                        requestTileAsync(zInt, wrappedTx, ty)
+                        if (isMapActive) {
+                            requestTileAsync(zInt, wrappedTx, ty)
+                        }
                     }
                 }
             }
