@@ -790,6 +790,9 @@ class VaultViewModel : ViewModel() {
     private val _isExporting = MutableStateFlow(false)
     val isExporting: StateFlow<Boolean> = _isExporting.asStateFlow()
 
+    private val _lastExportedFileUri = MutableStateFlow<Uri?>(null)
+    val lastExportedFileUri: StateFlow<Uri?> = _lastExportedFileUri.asStateFlow()
+
     private var importJob: Job? = null
     private var gpsBackfillJob: Job? = null
     private val isImportCancelled = AtomicBoolean(false)
@@ -844,7 +847,7 @@ class VaultViewModel : ViewModel() {
      * và xoá sạch toàn bộ các file đã lỡ mã hoá trong đợt import hiện tại.
      */
     fun cancelImport() {
-        if (!_isLoading.value && _videoFramePickRequest.value == null) return
+        if (!_isLoading.value && !_isExporting.value && _videoFramePickRequest.value == null) return
         isImportCancelled.set(true)
         _isCancellingImport.value = true
         _videoFramePickRequest.value = null
@@ -3049,9 +3052,13 @@ class VaultViewModel : ViewModel() {
     fun exportMultipleMedia(
         context: Context,
         itemsToExport: List<VaultItem>,
+        showOverlayLoading: Boolean = false,
         onFinished: ((Int) -> Unit)? = null
     ) {
-        if (itemsToExport.isEmpty()) return
+        if (itemsToExport.isEmpty()) {
+            onFinished?.invoke(0)
+            return
+        }
         val vaultUriVal = _vaultUri.value ?: return
         val key = _dek.value ?: return
 
@@ -3061,7 +3068,9 @@ class VaultViewModel : ViewModel() {
         _isExporting.value = true
 
         importJob = viewModelScope.launch {
-            _isLoading.value = true
+            if (showOverlayLoading) {
+                _isLoading.value = true
+            }
             _importProgress.value = 0f
             _isProcessCompleted.value = false
             _importQueueTotal.value = itemsToExport.size
@@ -3113,6 +3122,7 @@ class VaultViewModel : ViewModel() {
                             ?: throw java.io.IOException("Cannot create exported file: $uniqueExportName")
 
                         createdExportUris.add(destUri)
+                        _lastExportedFileUri.value = destUri
 
                         val streamCopied = CryptoEngine.getSgv2TierStream(context, item.uri, CryptoEngine.Tier.FULL, key)?.use { plainStream ->
                             context.contentResolver.openOutputStream(destUri)?.use { outStream ->
@@ -3143,7 +3153,11 @@ class VaultViewModel : ViewModel() {
                 }
 
                 vibrateThreeTimes(context)
-                playCompletionTickAnimation()
+                if (showOverlayLoading) {
+                    playCompletionTickAnimation()
+                } else {
+                    _importProgress.value = 1f
+                }
                 Toast.makeText(
                     context,
                     "Exported $exportedCount original file(s) to Vault folder",
@@ -3174,6 +3188,73 @@ class VaultViewModel : ViewModel() {
                     _importQueueIndex.value = 0
                 }
             }
+        }
+    }
+
+    /**
+     * Mở đúng thư mục lưu file vừa tải xuống (Export) bằng cơ chế tương thích với nền tảng Android hiện tại.
+     */
+    fun openExportedFolder(context: Context) {
+        val vaultTreeUri = _vaultUri.value ?: return
+        val lastFileUri = _lastExportedFileUri.value
+        try {
+            val treeDocId = DocumentsContract.getTreeDocumentId(vaultTreeUri)
+            val folderDocUri = DocumentsContract.buildDocumentUriUsingTree(vaultTreeUri, treeDocId)
+
+            val dirIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(folderDocUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_ACTIVITY_NEW_TASK
+                )
+            }
+            if (dirIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(dirIntent)
+                return
+            }
+
+            for (pkg in listOf("com.google.android.documentsui", "com.android.documentsui")) {
+                val docsUiIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(folderDocUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                    setPackage(pkg)
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                                Intent.FLAG_ACTIVITY_NEW_TASK
+                    )
+                }
+                if (docsUiIntent.resolveActivity(context.packageManager) != null) {
+                    context.startActivity(docsUiIntent)
+                    return
+                }
+            }
+
+            if (lastFileUri != null) {
+                val mime = context.contentResolver.getType(lastFileUri) ?: "*/*"
+                val viewFileIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(lastFileUri, mime)
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                if (viewFileIntent.resolveActivity(context.packageManager) != null) {
+                    context.startActivity(viewFileIntent)
+                    return
+                }
+            }
+
+            val openTreeIntent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    putExtra(DocumentsContract.EXTRA_INITIAL_URI, folderDocUri)
+                }
+                addFlags(
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_ACTIVITY_NEW_TASK
+                )
+            }
+            context.startActivity(openTreeIntent)
+        } catch (e: Exception) {
+            Toast.makeText(context, "Saved to Vault folder", Toast.LENGTH_SHORT).show()
         }
     }
 

@@ -1,8 +1,12 @@
 package com.example.ui.screens
 
+import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -44,6 +48,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -124,7 +129,9 @@ import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
@@ -133,7 +140,10 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
@@ -209,6 +219,9 @@ object FullBitmapCache {
         (maxMemKb / 8).coerceIn(16 * 1024, 48 * 1024)
     }
 
+    val version = mutableIntStateOf(0)
+    private val hdrSet = mutableSetOf<String>()
+
     private val cache = object : LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(maxCacheKb) {
         override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
             return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
@@ -219,18 +232,27 @@ object FullBitmapCache {
     fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache.get(key)
 
     @Synchronized
-    fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
+    fun isHdr(key: String): Boolean = key in hdrSet
+
+    @Synchronized
+    fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap, isHdr: Boolean = false) {
         cache.put(key, bitmap)
+        if (isHdr) hdrSet.add(key) else hdrSet.remove(key)
+        version.intValue++
     }
 
     @Synchronized
     fun remove(key: String) {
         cache.remove(key)
+        hdrSet.remove(key)
+        version.intValue++
     }
 
     @Synchronized
     fun clear() {
         cache.evictAll()
+        hdrSet.clear()
+        version.intValue++
     }
 }
 
@@ -244,7 +266,15 @@ object ScreenBitmapCache {
         (maxMemKb / 6).coerceIn(24 * 1024, 64 * 1024)
     }
 
+    val version = mutableIntStateOf(0)
+
     private val cache = object : LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(maxCacheKb) {
+        override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
+            return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
+        }
+    }
+
+    private val blurredCache = object : LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(4096) {
         override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
             return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
         }
@@ -254,18 +284,38 @@ object ScreenBitmapCache {
     fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache.get(key)
 
     @Synchronized
+    fun getBlurred(key: String): androidx.compose.ui.graphics.ImageBitmap? = blurredCache.get(key) ?: cache.get(key)
+
+    @Synchronized
     fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
         cache.put(key, bitmap)
+        try {
+            val src = bitmap.asAndroidBitmap()
+            val bw = src.width.coerceAtLeast(1)
+            val bh = src.height.coerceAtLeast(1)
+            val ratio = bw.toFloat() / bh.toFloat()
+            val tinyW = if (ratio >= 1f) 36 else (36f * ratio).toInt().coerceAtLeast(8)
+            val tinyH = if (ratio < 1f) 36 else (36f / ratio).toInt().coerceAtLeast(8)
+            val tiny = Bitmap.createScaledBitmap(src, tinyW, tinyH, true)
+            val smooth = Bitmap.createScaledBitmap(tiny, tinyW * 2, tinyH * 2, true)
+            if (tiny !== smooth && tiny !== src) tiny.recycle()
+            blurredCache.put(key, smooth.asImageBitmap())
+        } catch (_: Throwable) {}
+        version.intValue++
     }
 
     @Synchronized
     fun remove(key: String) {
         cache.remove(key)
+        blurredCache.remove(key)
+        version.intValue++
     }
 
     @Synchronized
     fun clear() {
         cache.evictAll()
+        blurredCache.evictAll()
+        version.intValue++
     }
 }
 
@@ -302,6 +352,37 @@ object MediaPropertiesCache {
  * 1. Không bao giờ vượt giới hạn 100MB của Android RecordingCanvas hay GL_MAX_TEXTURE_SIZE.
  * 2. Không gây OutOfMemoryError khi gặp ảnh 48MP / 108MP / 200MP.
  */
+private fun isBitmapTrueHdr(bitmap: Bitmap?, rawBytes: ByteArray? = null): Boolean {
+    if (bitmap == null) return false
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        try {
+            if (bitmap.hasGainmap()) return true
+        } catch (_: Throwable) {}
+    }
+    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+        try {
+            if (bitmap.config == Bitmap.Config.RGBA_1010102) return true
+            val cs = bitmap.colorSpace
+            if (cs != null) {
+                val csName = cs.name.uppercase(Locale.ROOT)
+                if (csName.contains("HLG") || csName.contains("PQ") || csName.contains("2100") || csName.contains("HDR")) {
+                    return true
+                }
+            }
+        } catch (_: Throwable) {}
+    }
+    if (rawBytes != null && rawBytes.isNotEmpty()) {
+        try {
+            val scanLen = minOf(rawBytes.size, 65536)
+            val headStr = String(rawBytes, 0, scanLen, Charsets.ISO_8859_1)
+            if (headStr.contains("hdrgm:Version") || headStr.contains("Item:Semantic=\"GainMap\"")) {
+                return true
+            }
+        } catch (_: Throwable) {}
+    }
+    return false
+}
+
 private fun decodeBoundedFullBitmap(bytes: ByteArray, maxDimension: Int = 3072): Bitmap? {
     if (bytes.isEmpty()) return null
     return try {
@@ -512,30 +593,19 @@ fun MediaViewerScreen(
     item: VaultItem,
     modifier: Modifier = Modifier
 ) {
-    Dialog(
-        onDismissRequest = { /* đóng do animateClose() + BackHandler bên trong tự lo */ },
-        properties = DialogProperties(
-            usePlatformDefaultWidth = false,
-            decorFitsSystemWindows = false,
-            dismissOnBackPress = false,
-            dismissOnClickOutside = false
-        )
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .zIndex(2000f)
+            .background(Color.Transparent)
     ) {
+        val context = LocalContext.current
         val dialogWindow = (LocalView.current.parent as? DialogWindowProvider)?.window
+            ?: (context as? Activity)?.window
         SideEffect {
             dialogWindow?.let { w ->
-                val attrs = w.attributes
-                attrs.flags = attrs.flags or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                        WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                attrs.gravity = Gravity.TOP or Gravity.START
-                attrs.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-                attrs.width = WindowManager.LayoutParams.MATCH_PARENT
-                attrs.height = WindowManager.LayoutParams.MATCH_PARENT
-                attrs.dimAmount = 0f
-                attrs.windowAnimations = 0
-
                 try {
+                    val attrs = w.attributes
                     val display = w.windowManager.defaultDisplay
                     val currentMode = display.mode
                     val bestMode = display.supportedModes
@@ -545,23 +615,19 @@ fun MediaViewerScreen(
                         }
                         .maxByOrNull { it.refreshRate }
 
-                    if (bestMode != null) {
+                    if (bestMode != null && attrs.preferredDisplayModeId != bestMode.modeId) {
                         attrs.preferredDisplayModeId = bestMode.modeId
+                        w.attributes = attrs
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
-
-                w.attributes = attrs
-                w.setBackgroundDrawableResource(android.R.color.transparent)
 
                 if (android.os.Build.VERSION.SDK_INT >= 34) {
                     w.decorView.requestedFrameRate = android.view.View.REQUESTED_FRAME_RATE_CATEGORY_HIGH
                 }
             }
         }
-
-        val context = LocalContext.current
         val dek by viewModel.dek.collectAsState()
         val items by viewModel.items.collectAsState()
         val mediaNotes by viewModel.mediaNotes.collectAsState()
@@ -578,18 +644,38 @@ fun MediaViewerScreen(
         var showInteractiveViewer by remember { mutableStateOf(false) }
         var isEntering by remember { mutableStateOf(true) }
 
-        var showControls by remember { mutableStateOf(false) }
+        var showControls by remember { mutableStateOf(true) }
+        var viewerFloatingBarState by remember { mutableStateOf(FloatingBarState.COLLAPSED) }
+        var liveOneShotTrigger by remember { mutableIntStateOf(0) }
+        val importProgress by viewModel.importProgress.collectAsState()
+        val isExporting by viewModel.isExporting.collectAsState()
+
+        val viewerImportLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.OpenMultipleDocuments()
+        ) { uris: List<Uri> ->
+            if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                @Suppress("DEPRECATION")
+                (context as? Activity)?.overridePendingTransition(0, 0)
+            }
+            if (uris.isNotEmpty()) {
+                viewModel.importMultipleMedia(context, uris)
+            }
+        }
         var isClosing by remember { mutableStateOf(false) }
         var keepPagerAlive by remember { mutableStateOf(false) }
 
         val progress = remember { Animatable(0f) }
         val closeTransitionAlpha = remember { Animatable(1f) }
 
-        var thumbImageBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-        var screenImageBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
-        var screenImageBitmapOwner by remember { mutableStateOf<String?>(null) }
-        val screenImageAlpha = remember { Animatable(0f) }
-        var thumbReady by remember { mutableStateOf(false) }
+        val initialCachedThumb = remember(item.encryptedName) { ThumbBitmapCache.get(item.encryptedName) }
+        val initialCachedScreen = remember(item.encryptedName) { ScreenBitmapCache.get(item.encryptedName) }
+        var thumbImageBitmap by remember { mutableStateOf(initialCachedThumb) }
+        var screenImageBitmap by remember { mutableStateOf(initialCachedScreen) }
+        var screenImageBitmapOwner by remember {
+            mutableStateOf(if (initialCachedScreen != null) item.encryptedName else null)
+        }
+        val screenImageAlpha = remember { Animatable(if (initialCachedScreen != null) 1f else 0f) }
+        var thumbReady by remember { mutableStateOf(initialCachedThumb != null) }
 
         var originalWidth by remember {
             mutableFloatStateOf(clickedBounds?.let { if (it.size >= 6) it[4] else 0f } ?: 0f)
@@ -677,8 +763,6 @@ fun MediaViewerScreen(
                 keepPagerAlive = false
                 isClosing = false
                 viewModel.setAnimatingItem(null)
-
-                delay(15L)
                 viewModel.selectMedia(null)
             }
         }
@@ -777,17 +861,28 @@ fun MediaViewerScreen(
                 showInfoDialog -> {
                     currentCloseSheet()
                 }
+                viewerFloatingBarState != FloatingBarState.COLLAPSED -> {
+                    if (viewerFloatingBarState == FloatingBarState.DOWNLOADING || isExporting) {
+                        viewModel.cancelImport()
+                    }
+                    viewerFloatingBarState = FloatingBarState.COLLAPSED
+                }
                 else -> {
                     animateClose()
                 }
             }
         }
 
-        LaunchedEffect(Unit) {
-            withFrameNanos { }
-            withFrameNanos { }
-            withTimeoutOrNull(80) { snapshotFlow { thumbReady }.first { it } }
+        SideEffect {
+            if (isEntering && thumbReady) {
+                viewModel.setAnimatingItem(item.encryptedName)
+            }
+        }
 
+        LaunchedEffect(Unit) {
+            if (!thumbReady) {
+                withTimeoutOrNull(50) { snapshotFlow { thumbReady }.first { it } }
+            }
             viewModel.setAnimatingItem(item.encryptedName)
 
             progress.animateTo(
@@ -939,6 +1034,7 @@ fun MediaViewerScreen(
 
         var pagerScrollEnabled by remember { mutableStateOf(true) }
         var isTouchingAnyInlineMap by remember { mutableStateOf(false) }
+        var inlineMapWindowBounds by remember { mutableStateOf<FloatArray?>(null) }
 
         LaunchedEffect(pagerState.currentPage) {
             val activeItem = items.getOrNull(pagerState.currentPage)
@@ -1094,7 +1190,7 @@ fun MediaViewerScreen(
                                             onSwipeUpEnd = {
                                                 handleSheetVerticalEnd()
                                             },
-                                            onVideoReady = { if (isCurrentPage) isVideoReadyForHdr = true },
+                                            onVideoReady = { isTrueHdr -> if (isCurrentPage) isVideoReadyForHdr = isTrueHdr },
                                             onDismissDragStart = { if (isCurrentPage) isHdrActive = false },
                                             onDismissDragCancel = { if (isCurrentPage && isVideoReadyForHdr) isHdrActive = true },
                                             onDismiss = { scaleVal, xVal, yVal ->
@@ -1118,8 +1214,9 @@ fun MediaViewerScreen(
                                             isPagerScrolling = isPagerScrolling,
                                             isInfoSheetOpen = isInfoSheetOpen,
                                             placeholderBitmap = bestPlaceholder,
+                                            liveOneShotTrigger = if (isCurrentPage) liveOneShotTrigger else 0,
                                             onDismissDragStart = { if (isCurrentPage) isHdrActive = false },
-                                            onDismissDragCancel = { if (isCurrentPage) isHdrActive = true },
+                                            onDismissDragCancel = { if (isCurrentPage && isImageReadyForHdr) isHdrActive = true },
                                             onDismiss = { scaleVal, xVal, yVal ->
                                                 activeZoomScale = 1f
                                                 activeZoomOffsetX = 0f
@@ -1160,7 +1257,7 @@ fun MediaViewerScreen(
                                             onSwipeUpEnd = {
                                                 handleSheetVerticalEnd()
                                             },
-                                            onFullImageReady = { if (isCurrentPage) isImageReadyForHdr = true }
+                                            onFullImageReady = { isTrueHdr -> if (isCurrentPage) isImageReadyForHdr = isTrueHdr }
                                         )
                                     }
                                 }
@@ -1194,6 +1291,11 @@ fun MediaViewerScreen(
                                             isTouchingAnyInlineMap = touching
                                         }
                                     },
+                                    onInlineMapBoundsChanged = { bounds ->
+                                        if (isCurrentPage) {
+                                            inlineMapWindowBounds = bounds
+                                        }
+                                    },
                                     modifier = Modifier.align(Alignment.BottomCenter)
                                 )
                             }
@@ -1224,6 +1326,11 @@ fun MediaViewerScreen(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
+                        .pointerInput(Unit) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false).consume()
+                            }
+                        }
                         .drawBehind {
                             val t = progress.value
                             drawRect(Color.Black, alpha = t * (1f - (abs(dragY) / (screenH / 2f)).coerceIn(0f, 1f)))
@@ -1311,81 +1418,14 @@ fun MediaViewerScreen(
                 }
             }
 
-            AnimatedVisibility(
-                visible = showControls && showInteractiveViewer,
-                enter = fadeIn() + slideInVertically(initialOffsetY = { -it }),
-                exit = fadeOut() + slideOutVertically(targetOffsetY = { -it }),
-                modifier = Modifier.align(Alignment.TopCenter)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(Color.Black.copy(alpha = 0.5f))
-                        .padding(horizontal = 8.dp, vertical = 12.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        IconButton(
-                            onClick = { animateClose() },
-                            modifier = Modifier.testTag("viewer_back_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back to Gallery",
-                                tint = Color.White
-                            )
-                        }
-
-                        Text(
-                            text = currentItem.originalName,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .weight(1f)
-                                .padding(horizontal = 12.dp)
-                        )
-
-                        Row {
-                            IconButton(
-                                onClick = { showInfoDialog = true },
-                                modifier = Modifier.testTag("viewer_info_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Info,
-                                    contentDescription = "File Properties",
-                                    tint = Color.White
-                                )
-                            }
-                            IconButton(
-                                onClick = { showDeleteDialog = true },
-                                modifier = Modifier.testTag("viewer_delete_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Delete,
-                                    contentDescription = "Delete File",
-                                    tint = MaterialTheme.colorScheme.error
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
             // HIỂN THỊ GHI CHÚ (NOTES) DƯỚI BOTTOM MÀN HÌNH, CĂN LỀ TRÁI, CHỮ TRẮNG SHADOW ĐEN MỜ
             val activeBottomNote = mediaNotes[currentItem.encryptedName]?.trim().orEmpty()
             val noteBottomSpace by animateDpAsState(
                 targetValue = when {
-                    currentItem.isVideo && showControls -> 136.dp
-                    currentItem.isLivePhoto && !currentItem.isVideo -> 58.dp
-                    else -> 24.dp
+                    currentItem.isVideo && showControls -> 200.dp
+                    else -> 84.dp
                 },
-                animationSpec = tween(durationMillis = 200),
+                animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f),
                 label = "note_bottom_space"
             )
             AnimatedVisibility(
@@ -1736,7 +1776,7 @@ fun MediaViewerScreen(
                                             .fillMaxSize()
                                             .navigationBarsPadding()
                                             .testTag("fullscreen_map_media_grid"),
-                                        contentPadding = PaddingValues(vertical = 1.dp),
+                                        contentPadding = PaddingValues(top = 1.dp, bottom = 84.dp),
                                         horizontalArrangement = Arrangement.spacedBy(1.dp),
                                         verticalArrangement = Arrangement.spacedBy(1.dp)
                                     ) {
@@ -1793,7 +1833,8 @@ fun MediaViewerScreen(
                                                         }
                                                     },
                                                     onPositioned = { _ -> },
-                                                    modifier = Modifier.animateItem()
+                                                    modifier = Modifier.animateItem(),
+                                                    dek = dek
                                                 )
                                             }
                                         }
@@ -1827,6 +1868,275 @@ fun MediaViewerScreen(
                     }
                 )
             }
+
+            // FLOATING BAR LUÔN LUÔN LÀ LỚP TRÊN CÙNG (zIndex cao nhất) Ở CẠNH DƯỚI MÀN HÌNH
+            // - Chỉ hiện icon Live khi đang xem ảnh có Live Photo (currentItem.isLivePhoto && !currentItem.isVideo)
+            // - Ở giữa chỉ có icon Download (không có icon dấu cộng khi ở full screen)
+            // - Có hiệu ứng background blur thực sự làm mờ mọi nội dung phía sau bar (ảnh/video, hiệu ứng đóng/mở, Details Sheet, Map)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .zIndex(1000f)
+                    .navigationBarsPadding()
+                    .padding(bottom = 12.dp)
+            ) {
+                GalleryFloatingBar(
+                    barState = viewerFloatingBarState,
+                    onBarStateChange = { newState ->
+                        viewerFloatingBarState = newState
+                    },
+                    onConfirmDownload = {
+                        viewerFloatingBarState = FloatingBarState.DOWNLOADING
+                        viewModel.exportMultipleMedia(
+                            context = context,
+                            itemsToExport = listOf(currentItem),
+                            showOverlayLoading = false
+                        ) {
+                            viewerFloatingBarState = FloatingBarState.DOWNLOAD_COMPLETED
+                        }
+                    },
+                    onCancelDownload = {
+                        if (viewerFloatingBarState == FloatingBarState.DOWNLOADING || isExporting) {
+                            viewModel.cancelImport()
+                        }
+                        viewerFloatingBarState = FloatingBarState.COLLAPSED
+                    },
+                    onShowInFolder = {
+                        viewModel.openExportedFolder(context)
+                    },
+                    onLiveClick = {
+                        if (currentItem.isLivePhoto && !currentItem.isVideo) {
+                            liveOneShotTrigger++
+                        }
+                    },
+                    onAddClick = {
+                        viewerImportLauncher.launch(arrayOf("image/*", "video/*"))
+                    },
+                    isViewerMode = true,
+                    isClosingToGrid = isClosing,
+                    isBarActive = true,
+                    showLiveButton = currentItem.isLivePhoto && !currentItem.isVideo,
+                    downloadProgress = importProgress,
+                    onInfoClick = {
+                        viewerFloatingBarState = FloatingBarState.COLLAPSED
+                        if (showFullScreenMap) {
+                            showFullScreenMap = false
+                            showInfoDialog = true
+                        } else {
+                            showInfoDialog = !showInfoDialog
+                        }
+                    },
+                    onDeleteClick = {
+                        viewerFloatingBarState = FloatingBarState.COLLAPSED
+                        showDeleteDialog = true
+                    },
+                    drawBackdrop = { barLeft, barTop ->
+                        val fullVer = FullBitmapCache.version.intValue
+                        val screenVer = ScreenBitmapCache.version.intValue
+                        val thumbVer = ThumbBitmapCache.version.intValue
+                        val mapVer = MapTileCache.version.intValue
+                        if (fullVer >= 0 && screenVer >= 0 && thumbVer >= 0 && mapVer >= 0) {
+                            if (!showInteractiveViewer || isEntering) {
+                                val t = progress.value.coerceIn(0f, 1f)
+                                val dimAlpha = (t * (1f - (abs(dragY) / (screenH / 2f)).coerceIn(0f, 1f))).coerceIn(0f, 1f)
+                                val gridAlpha = (1f - dimAlpha).coerceIn(0f, 1f)
+
+                                // 1. Vẽ nền Grid phía dưới đang mờ dần sang đen theo đúng tiến độ zoom (t)
+                                if (gridAlpha > 0.005f) {
+                                    drawGalleryGridBackdrop(
+                                        barLeft = barLeft,
+                                        barTop = barTop,
+                                        gridState = FloatingBarSharedState.gridStateRef,
+                                        gridWindowX = FloatingBarSharedState.gridWindowX,
+                                        gridWindowY = FloatingBarSharedState.gridWindowY,
+                                        boundsMap = boundsMap,
+                                        excludeEncryptedName = currentItem.encryptedName,
+                                        alphaMultiplier = gridAlpha
+                                    )
+                                }
+
+                                // 2. Tính chính xác toạ độ khung ảnh thực sự (coverScale -> fitScale) và khung cắt (clip)
+                                //    trên cửa sổ để ảnh đang zoom CHỈ xuất hiện trong vùng blur của bar khi phần ảnh thực sự chạm vào bar
+                                val currentTargetBounds = if (isEntering) startBounds else (boundsMap[currentItem.encryptedName] ?: startBounds)
+                                val trStartLeft = currentTargetBounds[0]
+                                val trStartTop = currentTargetBounds[1]
+                                val trStartWidth = currentTargetBounds.getOrNull(2)?.takeIf { it > 0f } ?: startWidth
+                                val trStartHeight = currentTargetBounds.getOrNull(3)?.takeIf { it > 0f } ?: startHeight
+
+                                val currentScale = lerp(1f, dragScale, t)
+                                val boxLeft = lerp(trStartLeft, dragX, t)
+                                val boxTop = lerp(trStartTop, dragY, t)
+                                val currentBoxW = lerp(trStartWidth, screenW, t)
+                                val currentBoxH = lerp(trStartHeight, screenH, t)
+
+                                val clipLeftWin = boxLeft
+                                val clipTopWin = boxTop
+                                val clipRightWin = boxLeft + currentBoxW * currentScale
+                                val clipBottomWin = boxTop + currentBoxH * currentScale
+
+                                val trBmp = ScreenBitmapCache.getBlurred(currentItem.encryptedName)
+                                    ?: ThumbBitmapCache.getBlurredAspect(currentItem.encryptedName)
+                                    ?: screenImageBitmap
+                                    ?: thumbImageBitmap
+                                    ?: ThumbBitmapCache.get(currentItem.encryptedName)
+
+                                if (trBmp != null && trBmp.width > 0 && trBmp.height > 0) {
+                                    val refBmp = screenImageBitmap ?: thumbImageBitmap ?: trBmp
+                                    val srcW = (refBmp.width.toFloat().takeIf { it > 0f } ?: trBmp.width.toFloat()).coerceAtLeast(1f)
+                                    val srcH = (refBmp.height.toFloat().takeIf { it > 0f } ?: trBmp.height.toFloat()).coerceAtLeast(1f)
+
+                                    val coverScale = maxOf(trStartWidth / srcW, trStartHeight / srcH)
+                                    val fitScale = minOf(screenW / srcW, screenH / srcH)
+                                    val baseScale = lerp(coverScale, fitScale, t)
+                                    val effZoomScale = if (isEntering) 1f else activeZoomScale
+                                    val effZoomOffX = if (isEntering) 0f else activeZoomOffsetX
+                                    val effZoomOffY = if (isEntering) 0f else activeZoomOffsetY
+                                    val relZoom = lerp(1f, effZoomScale, t)
+                                    val curScale = baseScale * relZoom
+
+                                    val curImgW = srcW * curScale
+                                    val curImgH = srcH * curScale
+
+                                    val boxRatioX = (currentBoxW / screenW.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val boxRatioY = (currentBoxH / screenH.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                                    val curOffsetX = effZoomOffX * t * boxRatioX
+                                    val curOffsetY = effZoomOffY * t * boxRatioY
+
+                                    val imgX = (currentBoxW - curImgW) / 2f + curOffsetX
+                                    val imgY = (currentBoxH - curImgH) / 2f + curOffsetY
+
+                                    val winImgLeft = boxLeft + imgX * currentScale
+                                    val winImgTop = boxTop + imgY * currentScale
+                                    val winImgW = curImgW * currentScale
+                                    val winImgH = curImgH * currentScale
+
+                                    val visLeftWin = maxOf(clipLeftWin, winImgLeft)
+                                    val visTopWin = maxOf(clipTopWin, winImgTop)
+                                    val visRightWin = minOf(clipRightWin, winImgLeft + winImgW)
+                                    val visBottomWin = minOf(clipBottomWin, winImgTop + winImgH)
+
+                                    val localClipLeft = visLeftWin - barLeft
+                                    val localClipTop = visTopWin - barTop
+                                    val localClipRight = visRightWin - barLeft
+                                    val localClipBottom = visBottomWin - barTop
+
+                                    if (localClipRight > 0f && localClipLeft < size.width &&
+                                        localClipBottom > 0f && localClipTop < size.height &&
+                                        localClipRight > localClipLeft && localClipBottom > localClipTop
+                                    ) {
+                                        clipRect(
+                                            left = localClipLeft.coerceIn(0f, size.width),
+                                            top = localClipTop.coerceIn(0f, size.height),
+                                            right = localClipRight.coerceIn(0f, size.width),
+                                            bottom = localClipBottom.coerceIn(0f, size.height)
+                                        ) {
+                                            drawRect(color = Color.Black)
+                                            drawImage(
+                                                image = trBmp,
+                                                dstOffset = IntOffset((winImgLeft - barLeft).toInt(), (winImgTop - barTop).toInt()),
+                                                dstSize = IntSize(winImgW.toInt().coerceAtLeast(1), winImgH.toInt().coerceAtLeast(1)),
+                                                filterQuality = FilterQuality.Medium
+                                            )
+                                        }
+                                    }
+                                }
+                            } else {
+                                val visiblePages = pagerState.layoutInfo.visiblePagesInfo
+                                if (visiblePages.isNotEmpty()) {
+                                    for (pageInfo in visiblePages) {
+                                        val pItem = items.getOrNull(pageInfo.index) ?: continue
+                                        val isCur = pageInfo.index == pagerState.currentPage
+                                        val bmp = ScreenBitmapCache.getBlurred(pItem.encryptedName)
+                                            ?: ThumbBitmapCache.getBlurredAspect(pItem.encryptedName)
+                                            ?: FullBitmapCache.get(pItem.encryptedName)
+                                            ?: (if (isCur) screenImageBitmap ?: thumbImageBitmap else null)
+                                            ?: ThumbBitmapCache.get(pItem.encryptedName)
+                                            ?: continue
+                                        if (bmp.width > 0 && bmp.height > 0) {
+                                            val refBmp = if (isCur) (screenImageBitmap ?: thumbImageBitmap ?: bmp) else bmp
+                                            val srcW = (refBmp.width.toFloat().takeIf { it > 0f } ?: bmp.width.toFloat()).coerceAtLeast(1f)
+                                            val srcH = (refBmp.height.toFloat().takeIf { it > 0f } ?: bmp.height.toFloat()).coerceAtLeast(1f)
+                                            val zScale = if (isCur) activeZoomScale else 1f
+                                            val zOffX = if (isCur) activeZoomOffsetX else 0f
+                                            val zOffY = if (isCur) activeZoomOffsetY else 0f
+                                            val fitScale = minOf(screenW / srcW, screenH / srcH) * zScale
+                                            val drawW = srcW * fitScale
+                                            val drawH = srcH * fitScale
+                                            val imgLeft = pageInfo.offset.toFloat() + (screenW - drawW) / 2f + zOffX - barLeft
+                                            val imgTop = (screenH - drawH) / 2f + zOffY - (0.5f * sheetHeightPx * sheetProgress.value) - barTop
+                                            val imgRight = imgLeft + drawW
+                                            val imgBottom = imgTop + drawH
+                                            if (imgRight > 0f && imgLeft < size.width &&
+                                                imgBottom > 0f && imgTop < size.height &&
+                                                imgRight > imgLeft && imgBottom > imgTop
+                                            ) {
+                                                clipRect(
+                                                    left = imgLeft.coerceIn(0f, size.width),
+                                                    top = imgTop.coerceIn(0f, size.height),
+                                                    right = imgRight.coerceIn(0f, size.width),
+                                                    bottom = imgBottom.coerceIn(0f, size.height)
+                                                ) {
+                                                    drawImage(
+                                                        image = bmp,
+                                                        dstOffset = IntOffset(imgLeft.toInt(), imgTop.toInt()),
+                                                        dstSize = IntSize(drawW.toInt().coerceAtLeast(1), drawH.toInt().coerceAtLeast(1)),
+                                                        filterQuality = FilterQuality.Medium
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Nếu bảng Details Sheet đang mở phía dưới floating bar, vẽ nền sheet & mini-map để làm mờ đúng nội dung thực
+                                if (sheetProgress.value > 0.005f) {
+                                    val sheetTopInWindow = screenH - sheetHeightPx * sheetProgress.value
+                                    val localSheetTop = (sheetTopInWindow - barTop).coerceAtLeast(0f)
+                                    if (localSheetTop < size.height) {
+                                        drawRect(
+                                            color = Color.Black,
+                                            topLeft = Offset(0f, localSheetTop),
+                                            size = Size(size.width, size.height - localSheetTop)
+                                        )
+                                        val mapB = inlineMapWindowBounds
+                                        if (mapB != null && mapB.size >= 4 && currentGps != null) {
+                                            val mx = mapB[0] - barLeft
+                                            val my = mapB[1] - barTop
+                                            val mw = mapB[2]
+                                            val mh = mapB[3]
+                                            if (my + mh >= 0f && my <= size.height) {
+                                                drawRect(
+                                                    color = Color(0xFF141820),
+                                                    topLeft = Offset(mx, my),
+                                                    size = Size(mw, mh)
+                                                )
+                                                val zInt = 15
+                                                val cx = floor(lonToTileX(currentGps.longitude, zInt.toDouble())).toInt()
+                                                val cy = floor(latToTileY(currentGps.latitude, zInt.toDouble())).toInt()
+                                                val tileBmp = MapTileCache.get("$zInt/$cx/$cy")
+                                                    ?: MapTileCache.get("${zInt + 1}/${cx * 2}/${cy * 2}")
+                                                if (tileBmp != null) {
+                                                    drawImage(
+                                                        image = tileBmp,
+                                                        dstOffset = IntOffset(mx.toInt(), my.toInt()),
+                                                        dstSize = IntSize(mw.toInt().coerceAtLeast(1), mh.toInt().coerceAtLeast(1)),
+                                                        filterQuality = FilterQuality.Medium
+                                                    )
+                                                }
+                                                drawCircle(
+                                                    color = Color(0xFFFFFF00).copy(alpha = 0.55f),
+                                                    radius = 28.dp.toPx(),
+                                                    center = Offset(mx + mw / 2f, my + mh / 2f)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                )
+            }
         }
     }
 }
@@ -1853,6 +2163,7 @@ private fun MediaPagePropertiesSheet(
     onCloseSheet: () -> Unit,
     onOpenFullScreenMap: () -> Unit,
     onInlineMapTouchChanged: (Boolean) -> Unit,
+    onInlineMapBoundsChanged: (FloatArray?) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -2328,12 +2639,25 @@ private fun MediaPagePropertiesSheet(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(210.dp)
+                        .aspectRatio(16f / 9f)
+                        .onGloballyPositioned { coords ->
+                            if (isCurrentPage) {
+                                val pos = coords.positionInWindow()
+                                val sz = coords.size
+                                onInlineMapBoundsChanged(
+                                    floatArrayOf(pos.x, pos.y, sz.width.toFloat(), sz.height.toFloat())
+                                )
+                            }
+                        }
                         .then(if (isCurrentPage) Modifier.testTag("details_gps_heatmap_map") else Modifier)
                 )
+            } else if (isCurrentPage) {
+                LaunchedEffect(Unit) {
+                    onInlineMapBoundsChanged(null)
+                }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(84.dp))
         }
     }
 }
@@ -2348,6 +2672,7 @@ fun EncryptedImageViewer(
     isPagerScrolling: Boolean = false,
     isInfoSheetOpen: Boolean = false,
     placeholderBitmap: androidx.compose.ui.graphics.ImageBitmap? = null,
+    liveOneShotTrigger: Int = 0,
     onDismiss: (scale: Float, x: Float, y: Float) -> Unit,
     onDismissDragStart: () -> Unit = {},
     onDismissDragCancel: () -> Unit = {},
@@ -2356,7 +2681,7 @@ fun EncryptedImageViewer(
     onTap: () -> Unit,
     onSwipeUpDelta: (Float) -> Unit = {},
     onSwipeUpEnd: () -> Unit = {},
-    onFullImageReady: () -> Unit = {}
+    onFullImageReady: (Boolean) -> Unit = {}
 ) {
     val coroutineScope = rememberCoroutineScope()
     val scale = remember { Animatable(1f) }
@@ -2388,20 +2713,35 @@ fun EncryptedImageViewer(
     var fullBitmap by remember(item.encryptedName) {
         mutableStateOf(FullBitmapCache.get(item.encryptedName))
     }
+    var isCurrentImageTrueHdr by remember(item.encryptedName) {
+        mutableStateOf(FullBitmapCache.isHdr(item.encryptedName))
+    }
     val fullImageAlpha = remember(item.encryptedName) {
         Animatable(if (FullBitmapCache.get(item.encryptedName) != null) 1f else 0f)
     }
 
-    // Trạng thái phát video nhúng của Live Photo (khi nhấn giữ ảnh hoặc bấm vào nút LIVE)
-    var isPlayingLivePhoto by remember(item.encryptedName) { mutableStateOf(false) }
+    // Phân biệt rõ 2 chế độ phát Live Photo:
+    // 1. isOneShotLivePlaying: nhấn icon Live trên floating bar -> phát 1 lần duy nhất (REPEAT_MODE_OFF), không loop.
+    // 2. isHoldingLivePhoto: nhấn giữ ảnh -> phát và loop liên tục (REPEAT_MODE_ONE) trong suốt thời gian giữ, dừng ngay khi thả tay.
+    var isOneShotLivePlaying by remember(item.encryptedName) { mutableStateOf(false) }
+    var isHoldingLivePhoto by remember(item.encryptedName) { mutableStateOf(false) }
+    val isPlayingLivePhoto = isOneShotLivePlaying || isHoldingLivePhoto
     var isLiveVideoRendered by remember(item.encryptedName) { mutableStateOf(false) }
     var liveVideoWidth by remember(item.encryptedName) { mutableIntStateOf(0) }
     var liveVideoHeight by remember(item.encryptedName) { mutableIntStateOf(0) }
     var liveExoPlayer by remember(item.encryptedName) { mutableStateOf<ExoPlayer?>(null) }
 
+    LaunchedEffect(liveOneShotTrigger) {
+        if (liveOneShotTrigger > 0 && item.isLivePhoto && isActivePage) {
+            isHoldingLivePhoto = false
+            isOneShotLivePlaying = true
+        }
+    }
+
     LaunchedEffect(isActivePage) {
         if (!isActivePage) {
-            isPlayingLivePhoto = false
+            isOneShotLivePlaying = false
+            isHoldingLivePhoto = false
             isLiveVideoRendered = false
             liveExoPlayer?.let { p ->
                 p.playWhenReady = false
@@ -2413,8 +2753,9 @@ fun EncryptedImageViewer(
         }
     }
 
-    LaunchedEffect(isPlayingLivePhoto, isActivePage) {
+    LaunchedEffect(isPlayingLivePhoto, isHoldingLivePhoto, isOneShotLivePlaying, liveOneShotTrigger, isActivePage) {
         if (item.isLivePhoto && isPlayingLivePhoto && isActivePage) {
+            val targetRepeatMode = if (isHoldingLivePhoto) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
             if (liveExoPlayer == null) {
                 val liveUri = item.uri.buildUpon().appendQueryParameter("live", "1").build()
                 liveExoPlayer = ExoPlayer.Builder(context).build().apply {
@@ -2422,6 +2763,7 @@ fun EncryptedImageViewer(
                         EncryptedDataSourceFactory(context, dek)
                     ).createMediaSource(MediaItem.fromUri(liveUri))
                     setMediaSource(mediaSource)
+                    repeatMode = targetRepeatMode
                     prepare()
                     addListener(object : Player.Listener {
                         override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
@@ -2436,14 +2778,15 @@ fun EncryptedImageViewer(
                         }
 
                         override fun onPlaybackStateChanged(playbackState: Int) {
-                            if (playbackState == Player.STATE_ENDED) {
-                                isPlayingLivePhoto = false
+                            if (playbackState == Player.STATE_ENDED && repeatMode == Player.REPEAT_MODE_OFF) {
+                                isOneShotLivePlaying = false
                                 isLiveVideoRendered = false
                             }
                         }
                     })
                 }
             } else {
+                liveExoPlayer?.repeatMode = targetRepeatMode
                 liveExoPlayer?.seekTo(0L)
             }
             liveExoPlayer?.playWhenReady = true
@@ -2473,6 +2816,7 @@ fun EncryptedImageViewer(
     LaunchedEffect(item.encryptedName, dek, isActivePage, isPagerScrolling) {
         val cachedFull = FullBitmapCache.get(item.encryptedName)
         if (cachedFull != null) {
+            isCurrentImageTrueHdr = FullBitmapCache.isHdr(item.encryptedName)
             fullBitmap = cachedFull
             return@LaunchedEffect
         }
@@ -2510,9 +2854,11 @@ fun EncryptedImageViewer(
 
                         val finalBmp = decodeBoundedFullBitmap(bytes, maxDimension = 3072)
                         if (finalBmp != null) {
+                            val trueHdr = isBitmapTrueHdr(finalBmp, bytes)
                             val imgBmp = finalBmp.asImageBitmap()
-                            FullBitmapCache.put(item.encryptedName, imgBmp)
+                            FullBitmapCache.put(item.encryptedName, imgBmp, trueHdr)
                             withContext(Dispatchers.Main) {
+                                isCurrentImageTrueHdr = trueHdr
                                 fullBitmap = imgBmp
                             }
                             succeeded = true
@@ -2532,10 +2878,10 @@ fun EncryptedImageViewer(
         }
     }
 
-    LaunchedEffect(fullBitmap) {
+    LaunchedEffect(fullBitmap, isCurrentImageTrueHdr) {
         if (fullBitmap != null) {
             fullImageAlpha.animateTo(1f, animationSpec = tween(durationMillis = 250))
-            onFullImageReady()
+            onFullImageReady(isCurrentImageTrueHdr)
         }
     }
 
@@ -2610,138 +2956,144 @@ fun EncryptedImageViewer(
                             delay(280L)
                             if (!isPinching && !isDraggingToDismiss && !hasMovedSignificantDistance) {
                                 triggeredLiveHold = true
-                                isPlayingLivePhoto = true
+                                isOneShotLivePlaying = false
+                                isHoldingLivePhoto = true
                             }
                         }
                     } else null
 
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val pointers = event.changes
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val pointers = event.changes
 
-                        if (pointers.isEmpty() || pointers.all { !it.pressed }) break
+                            if (pointers.isEmpty() || pointers.all { !it.pressed }) break
 
-                        val firstPointer = pointers.firstOrNull()
-                        if (firstPointer != null) {
-                            val dist = (firstPointer.position - startPos).getDistance()
-                            if (dist > 15f) {
-                                hasMovedSignificantDistance = true
+                            val firstPointer = pointers.firstOrNull()
+                            if (firstPointer != null) {
+                                val dist = (firstPointer.position - startPos).getDistance()
+                                if (dist > 15f) {
+                                    hasMovedSignificantDistance = true
+                                    liveHoldJob?.cancel()
+                                }
+                            }
+
+                            if (pointers.size >= 2 && !currentIsInfoSheetOpen) {
+                                isPinching = true
                                 liveHoldJob?.cancel()
-                            }
-                        }
+                                val pointer1 = pointers[0]
+                                val pointer2 = pointers[1]
+                                val pos1 = pointer1.position
+                                val pos2 = pointer2.position
+                                val prevPos1 = pointer1.previousPosition
+                                val prevPos2 = pointer2.previousPosition
 
-                        if (pointers.size >= 2 && !currentIsInfoSheetOpen) {
-                            isPinching = true
-                            liveHoldJob?.cancel()
-                            val pointer1 = pointers[0]
-                            val pointer2 = pointers[1]
-                            val pos1 = pointer1.position
-                            val pos2 = pointer2.position
-                            val prevPos1 = pointer1.previousPosition
-                            val prevPos2 = pointer2.previousPosition
+                                val currentDistance = (pos1 - pos2).getDistance()
+                                val previousDistance = (prevPos1 - prevPos2).getDistance()
 
-                            val currentDistance = (pos1 - pos2).getDistance()
-                            val previousDistance = (prevPos1 - prevPos2).getDistance()
+                                if (previousDistance > 0f && currentDistance > 0f) {
+                                    val zoomFactor = currentDistance / previousDistance
+                                    val newScale = (gestureScale * zoomFactor).coerceIn(0.8f, 10f)
+                                    val actualZoomFactor = if (gestureScale != 0f) newScale / gestureScale else 1f
 
-                            if (previousDistance > 0f && currentDistance > 0f) {
-                                val zoomFactor = currentDistance / previousDistance
-                                val newScale = (gestureScale * zoomFactor).coerceIn(0.8f, 10f)
-                                val actualZoomFactor = if (gestureScale != 0f) newScale / gestureScale else 1f
+                                    // Vừa zoom theo khoảng cách 2 ngón, vừa di chuyển theo điểm trung tâm (midpoint) của 2 ngón tay
+                                    val currentCentroid = (pos1 + pos2) / 2f
+                                    val previousCentroid = (prevPos1 + prevPos2) / 2f
+                                    val prevOriginX = previousCentroid.x - (width / 2f)
+                                    val prevOriginY = previousCentroid.y - (height / 2f)
+                                    val curOriginX = currentCentroid.x - (width / 2f)
+                                    val curOriginY = currentCentroid.y - (height / 2f)
 
-                                // Vừa zoom theo khoảng cách 2 ngón, vừa di chuyển theo điểm trung tâm (midpoint) của 2 ngón tay
-                                val currentCentroid = (pos1 + pos2) / 2f
-                                val previousCentroid = (prevPos1 + prevPos2) / 2f
-                                val prevOriginX = previousCentroid.x - (width / 2f)
-                                val prevOriginY = previousCentroid.y - (height / 2f)
-                                val curOriginX = currentCentroid.x - (width / 2f)
-                                val curOriginY = currentCentroid.y - (height / 2f)
+                                    val newX = curOriginX - (prevOriginX - gestureOffsetX) * actualZoomFactor
+                                    val newY = curOriginY - (prevOriginY - gestureOffsetY) * actualZoomFactor
 
-                                val newX = curOriginX - (prevOriginX - gestureOffsetX) * actualZoomFactor
-                                val newY = curOriginY - (prevOriginY - gestureOffsetY) * actualZoomFactor
+                                    gestureScale = newScale
+                                    if (newScale > 1f) {
+                                        val maxOffsetX = (width * newScale - width) / 2f
+                                        val maxOffsetY = (height * newScale - height) / 2f
+                                        gestureOffsetX = newX.coerceIn(-maxOffsetX, maxOffsetX)
+                                        gestureOffsetY = newY.coerceIn(-maxOffsetY, maxOffsetY)
+                                    } else {
+                                        gestureOffsetX = newX
+                                        gestureOffsetY = newY
+                                    }
 
-                                gestureScale = newScale
-                                if (newScale > 1f) {
-                                    val maxOffsetX = (width * newScale - width) / 2f
-                                    val maxOffsetY = (height * newScale - height) / 2f
-                                    gestureOffsetX = newX.coerceIn(-maxOffsetX, maxOffsetX)
-                                    gestureOffsetY = newY.coerceIn(-maxOffsetY, maxOffsetY)
-                                } else {
-                                    gestureOffsetX = newX
-                                    gestureOffsetY = newY
+                                    coroutineScope.launch {
+                                        scale.snapTo(gestureScale)
+                                        offsetX.snapTo(gestureOffsetX)
+                                        offsetY.snapTo(gestureOffsetY)
+                                    }
                                 }
+                                pointers.forEach { it.consume() }
+                            } else if (pointers.size == 1 && !isPinching) {
+                                val pointer = pointers[0]
+                                val currentPos = pointer.position
+                                val prevPos = pointer.previousPosition
+                                val delta = currentPos - prevPos
 
-                                coroutineScope.launch {
-                                    scale.snapTo(gestureScale)
-                                    offsetX.snapTo(gestureOffsetX)
-                                    offsetY.snapTo(gestureOffsetY)
-                                }
-                            }
-                            pointers.forEach { it.consume() }
-                        } else if (pointers.size == 1 && !isPinching) {
-                            val pointer = pointers[0]
-                            val currentPos = pointer.position
-                            val prevPos = pointer.previousPosition
-                            val delta = currentPos - prevPos
+                                if (gestureScale > 1.05f && !currentIsInfoSheetOpen) {
+                                    val maxOffsetX = (width * gestureScale - width) / 2f
+                                    val maxOffsetY = (height * gestureScale - height) / 2f
+                                    gestureOffsetX = (gestureOffsetX + delta.x).coerceIn(-maxOffsetX, maxOffsetX)
+                                    gestureOffsetY = (gestureOffsetY + delta.y).coerceIn(-maxOffsetY, maxOffsetY)
+                                    coroutineScope.launch {
+                                        offsetX.snapTo(gestureOffsetX)
+                                        offsetY.snapTo(gestureOffsetY)
+                                    }
+                                    pointer.consume()
+                                } else if (!triggeredLiveHold) {
+                                    val absoluteDeltaX = abs(delta.x)
+                                    val absoluteDeltaY = abs(delta.y)
+                                    val totalDy = currentPos.y - startPos.y
+                                    val totalDx = currentPos.x - startPos.x
 
-                            if (gestureScale > 1.05f && !currentIsInfoSheetOpen) {
-                                val maxOffsetX = (width * gestureScale - width) / 2f
-                                val maxOffsetY = (height * gestureScale - height) / 2f
-                                gestureOffsetX = (gestureOffsetX + delta.x).coerceIn(-maxOffsetX, maxOffsetX)
-                                gestureOffsetY = (gestureOffsetY + delta.y).coerceIn(-maxOffsetY, maxOffsetY)
-                                coroutineScope.launch {
-                                    offsetX.snapTo(gestureOffsetX)
-                                    offsetY.snapTo(gestureOffsetY)
-                                }
-                                pointer.consume()
-                            } else if (!triggeredLiveHold) {
-                                val absoluteDeltaX = abs(delta.x)
-                                val absoluteDeltaY = abs(delta.y)
-                                val totalDy = currentPos.y - startPos.y
-                                val totalDx = currentPos.x - startPos.x
+                                    if (currentIsInfoSheetOpen) {
+                                        if (isSwipingUpForInfo || (abs(totalDy) > 8f && abs(totalDy) > abs(totalDx) * 1.15f)) {
+                                            isSwipingUpForInfo = true
+                                            onSwipeUpDelta(delta.y)
+                                            pointer.consume()
+                                        }
+                                    } else if (!isSwipingUpForInfo && (isDraggingToDismiss || (delta.y > 0f && absoluteDeltaY > absoluteDeltaX * 1.5f && absoluteDeltaY > 10f))) {
+                                        liveHoldJob?.cancel()
+                                        isHoldingLivePhoto = false
+                                        isOneShotLivePlaying = false
+                                        isLiveVideoRendered = false
+                                        if (!isDraggingToDismiss) onDismissDragStart()
+                                        isDraggingToDismiss = true
+                                        isDraggingToDismissState = true
 
-                                if (currentIsInfoSheetOpen) {
-                                    if (isSwipingUpForInfo || (abs(totalDy) > 8f && abs(totalDy) > abs(totalDx) * 1.15f)) {
+                                        gestureOffsetY += delta.y
+                                        gestureOffsetX += delta.x
+
+                                        val swipeProgress = (abs(gestureOffsetY) / (height * 0.8f)).coerceIn(0f, 1f)
+                                        gestureScale = (1f - (swipeProgress * 0.4f)).coerceAtLeast(0.6f)
+                                        val dimAlpha = (1f - (abs(gestureOffsetY) / (screenH / 2f))).coerceIn(0f, 1f)
+
+                                        coroutineScope.launch {
+                                            offsetX.snapTo(gestureOffsetX)
+                                            offsetY.snapTo(gestureOffsetY)
+                                            scale.snapTo(gestureScale)
+                                            backgroundDimAlpha.snapTo(dimAlpha)
+                                        }
+                                        pointer.consume()
+                                    } else if (!isDraggingToDismiss && (isSwipingUpForInfo || (totalDy < -6f && abs(totalDy) > abs(totalDx) * 1.15f))) {
+                                        liveHoldJob?.cancel()
                                         isSwipingUpForInfo = true
                                         onSwipeUpDelta(delta.y)
                                         pointer.consume()
                                     }
-                                } else if (!isSwipingUpForInfo && (isDraggingToDismiss || (delta.y > 0f && absoluteDeltaY > absoluteDeltaX * 1.5f && absoluteDeltaY > 10f))) {
-                                    liveHoldJob?.cancel()
-                                    isPlayingLivePhoto = false
-                                    isLiveVideoRendered = false
-                                    if (!isDraggingToDismiss) onDismissDragStart()
-                                    isDraggingToDismiss = true
-                                    isDraggingToDismissState = true
-
-                                    gestureOffsetY += delta.y
-                                    gestureOffsetX += delta.x
-
-                                    val swipeProgress = (abs(gestureOffsetY) / (height * 0.8f)).coerceIn(0f, 1f)
-                                    gestureScale = (1f - (swipeProgress * 0.4f)).coerceAtLeast(0.6f)
-                                    val dimAlpha = (1f - (abs(gestureOffsetY) / (screenH / 2f))).coerceIn(0f, 1f)
-
-                                    coroutineScope.launch {
-                                        offsetX.snapTo(gestureOffsetX)
-                                        offsetY.snapTo(gestureOffsetY)
-                                        scale.snapTo(gestureScale)
-                                        backgroundDimAlpha.snapTo(dimAlpha)
-                                    }
-                                    pointer.consume()
-                                } else if (!isDraggingToDismiss && (isSwipingUpForInfo || (totalDy < -6f && abs(totalDy) > abs(totalDx) * 1.15f))) {
-                                    liveHoldJob?.cancel()
-                                    isSwipingUpForInfo = true
-                                    onSwipeUpDelta(delta.y)
-                                    pointer.consume()
                                 }
                             }
                         }
-                    }
 
-                    liveHoldJob?.cancel()
+                    } finally {
+                        liveHoldJob?.cancel()
+                        isHoldingLivePhoto = false
+                    }
                     if (isSwipingUpForInfo) {
                         onSwipeUpEnd()
                     } else if (triggeredLiveHold) {
-                        isPlayingLivePhoto = false
+                        isHoldingLivePhoto = false
                     } else if (!isPinching && !isDraggingToDismiss && !hasMovedSignificantDistance) {
                         pendingSingleTapJob?.cancel()
                         if (currentIsInfoSheetOpen) {
@@ -2915,46 +3267,7 @@ fun EncryptedImageViewer(
                 )
             }
 
-            // Nút / Huy hiệu LIVE cho ảnh Live Photo
-            if (item.isLivePhoto && !isInfoSheetOpen) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .navigationBarsPadding()
-                        .padding(start = 16.dp, bottom = 20.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(
-                            if (isPlayingLivePhoto) MaterialTheme.colorScheme.primary
-                            else Color.Black.copy(alpha = 0.62f)
-                        )
-                        .border(
-                            width = 1.dp,
-                            color = if (isPlayingLivePhoto) MaterialTheme.colorScheme.primary else Color.White.copy(alpha = 0.35f),
-                            shape = RoundedCornerShape(999.dp)
-                        )
-                        .clickable {
-                            isPlayingLivePhoto = !isPlayingLivePhoto
-                        }
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
-                        .testTag("live_photo_badge_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.MotionPhotosOn,
-                        contentDescription = "Play Live Photo",
-                        tint = if (isPlayingLivePhoto) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = if (isPlayingLivePhoto) "LIVE • PLAYING" else "LIVE",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.8.sp,
-                        color = if (isPlayingLivePhoto) MaterialTheme.colorScheme.onPrimary else Color.White
-                    )
-                }
-            }
+
         }
     }
 }
@@ -2973,7 +3286,7 @@ fun EncryptedVideoPlayer(
     onTap: () -> Unit,
     onSwipeUpDelta: (Float) -> Unit = {},
     onSwipeUpEnd: () -> Unit = {},
-    onVideoReady: () -> Unit,
+    onVideoReady: (Boolean) -> Unit,
     onDismissDragStart: () -> Unit = {},
     onDismissDragCancel: () -> Unit = {},
     onDismiss: (Float, Float, Float) -> Unit
@@ -3047,7 +3360,11 @@ fun EncryptedVideoPlayer(
                             }
                             override fun onRenderedFirstFrame() {
                                 isVideoReady = true
-                                onVideoReady()
+                                val colorTransfer = this@apply.videoFormat?.colorInfo?.colorTransfer
+                                    ?: androidx.media3.common.C.INDEX_UNSET
+                                val isTrueHdrVideo = colorTransfer == androidx.media3.common.C.COLOR_TRANSFER_HLG ||
+                                        colorTransfer == androidx.media3.common.C.COLOR_TRANSFER_ST2084
+                                onVideoReady(isTrueHdrVideo)
                             }
                             override fun onIsPlayingChanged(playing: Boolean) {
                                 isPlaying = playing
@@ -3301,6 +3618,7 @@ fun EncryptedVideoPlayer(
                 modifier = Modifier
                     .fillMaxWidth()
                     .navigationBarsPadding()
+                    .padding(bottom = 72.dp)
             ) {
                 Column(
                     modifier = Modifier

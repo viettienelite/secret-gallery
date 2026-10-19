@@ -8,9 +8,11 @@ import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import android.view.TextureView
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -41,17 +43,25 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.requiredSize
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -72,7 +82,9 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.MotionPhotosOn
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.PlayArrow
@@ -97,17 +109,23 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -118,7 +136,12 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathMeasure
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.FilterQuality
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -132,20 +155,30 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import coil.ImageLoader
 import coil.compose.rememberAsyncImagePainter
 import coil.request.ImageRequest
 import coil.size.Size
 import com.example.coil.EncryptedUriFetcher
+import com.example.media.EncryptedDataSourceFactory
 import com.example.ui.VaultItem
 import com.example.ui.VaultViewModel
 import com.example.ui.VideoFramePickRequest
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
@@ -158,7 +191,21 @@ object ThumbBitmapCache {
         (maxMemKb / 10).coerceIn(12 * 1024, 32 * 1024)
     }
 
+    val version = mutableIntStateOf(0)
+
     private val cache = object : android.util.LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(maxCacheKb) {
+        override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
+            return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
+        }
+    }
+
+    private val blurredCache = object : android.util.LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(4096) {
+        override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
+            return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
+        }
+    }
+
+    private val blurredAspectCache = object : android.util.LruCache<String, androidx.compose.ui.graphics.ImageBitmap>(4096) {
         override fun sizeOf(key: String, value: androidx.compose.ui.graphics.ImageBitmap): Int {
             return ((value.width.toLong() * value.height.toLong() * 4L) / 1024L).toInt().coerceAtLeast(1)
         }
@@ -168,18 +215,53 @@ object ThumbBitmapCache {
     fun get(key: String): androidx.compose.ui.graphics.ImageBitmap? = cache.get(key)
 
     @Synchronized
+    fun getBlurred(key: String): androidx.compose.ui.graphics.ImageBitmap? = blurredCache.get(key) ?: cache.get(key)
+
+    @Synchronized
+    fun getBlurredAspect(key: String): androidx.compose.ui.graphics.ImageBitmap? = blurredAspectCache.get(key) ?: cache.get(key)
+
+    @Synchronized
     fun put(key: String, bitmap: androidx.compose.ui.graphics.ImageBitmap) {
         cache.put(key, bitmap)
+        try {
+            val src = bitmap.asAndroidBitmap()
+            val bw = src.width.coerceAtLeast(1)
+            val bh = src.height.coerceAtLeast(1)
+            val edge = minOf(bw, bh)
+            val cropX = (bw - edge) / 2
+            val cropY = (bh - edge) / 2
+            val square = Bitmap.createBitmap(src, cropX, cropY, edge, edge)
+            val tiny = Bitmap.createScaledBitmap(square, 20, 20, true)
+            val blurred = Bitmap.createScaledBitmap(tiny, 48, 48, true)
+            if (square !== src) square.recycle()
+            if (tiny !== blurred) tiny.recycle()
+            blurredCache.put(key, blurred.asImageBitmap())
+
+            val ratio = bw.toFloat() / bh.toFloat()
+            val tinyAspectW = if (ratio >= 1f) 32 else (32f * ratio).toInt().coerceAtLeast(8)
+            val tinyAspectH = if (ratio < 1f) 32 else (32f / ratio).toInt().coerceAtLeast(8)
+            val tinyAspect = Bitmap.createScaledBitmap(src, tinyAspectW, tinyAspectH, true)
+            val smoothAspect = Bitmap.createScaledBitmap(tinyAspect, tinyAspectW * 2, tinyAspectH * 2, true)
+            if (tinyAspect !== smoothAspect && tinyAspect !== src) tinyAspect.recycle()
+            blurredAspectCache.put(key, smoothAspect.asImageBitmap())
+        } catch (_: Throwable) {}
+        version.intValue++
     }
 
     @Synchronized
     fun remove(key: String) {
         cache.remove(key)
+        blurredCache.remove(key)
+        blurredAspectCache.remove(key)
+        version.intValue++
     }
 
     @Synchronized
     fun clear() {
         cache.evictAll()
+        blurredCache.evictAll()
+        blurredAspectCache.evictAll()
+        version.intValue++
     }
 }
 
@@ -499,6 +581,1030 @@ private data class EncryptingThumbState(
     val isLivePhoto: Boolean
 )
 
+internal const val FLOATING_BAR_SPRING_DAMPING = 0.7f
+internal const val FLOATING_BAR_SPRING_STIFFNESS = 300f
+
+internal fun <T> floatingBarSpring(): androidx.compose.animation.core.SpringSpec<T> =
+    spring(dampingRatio = 0.7f, stiffness = 300f)
+
+enum class FloatingBarState {
+    COLLAPSED,
+    CONFIRM_DOWNLOAD,
+    DOWNLOADING,
+    DOWNLOAD_COMPLETED
+}
+
+/**
+ * Lưu trạng thái chuyển tiếp liền mạch giữa Floating Bar của GalleryScreen và MediaViewerScreen
+ * để khi đóng/mở ảnh không bao giờ bị nháy ẩn mất 1 frame, đồng thời width và các icon
+ * co dãn / chuyển đổi liên tục bằng spring animation.
+ */
+internal object FloatingBarSharedState {
+    var lastCenterX: Float = 0f
+    var lastBottomY: Float = 0f
+    var lastWindowX: Float = 0f
+    var lastWindowY: Float = 0f
+    var viewerMorphProgress: Float = 0f
+    var liveSlotProgress: Float = 0f
+    var selectionModeProgress: Float = 0f
+    var deleteSelectedSlotProgress: Float = 0f
+    var lastIsSelectionMode: Boolean = false
+    var lastIsFullVaultSelected: Boolean = false
+    var lastHasSelectedItems: Boolean = false
+    var gridStateRef: LazyGridState? = null
+    var gridWindowX: Float = 0f
+    var gridWindowY: Float = 0f
+}
+
+internal fun DrawScope.drawGalleryGridBackdrop(
+    barLeft: Float,
+    barTop: Float,
+    gridState: LazyGridState?,
+    gridWindowX: Float,
+    gridWindowY: Float,
+    boundsMap: Map<String, FloatArray>,
+    excludeEncryptedName: String? = null,
+    alphaMultiplier: Float = 1f
+) {
+    val effAlpha = alphaMultiplier.coerceIn(0f, 1f)
+    if (effAlpha <= 0.005f) return
+
+    val barRight = barLeft + size.width
+    val barBottom = barTop + size.height
+    val visibleInfoList = gridState?.layoutInfo?.visibleItemsInfo.orEmpty()
+
+    if (visibleInfoList.isNotEmpty()) {
+        for (info in visibleInfoList) {
+            val keyStr = info.key as? String ?: continue
+            if (excludeEncryptedName != null && keyStr == excludeEncryptedName) continue
+            val tx = gridWindowX + info.offset.x.toFloat()
+            val ty = gridWindowY + info.offset.y.toFloat()
+            val tw = info.size.width.toFloat()
+            val th = info.size.height.toFloat()
+            if (tx + tw >= barLeft - 24f && tx <= barRight + 24f &&
+                ty + th >= barTop - 24f && ty <= barBottom + 24f
+            ) {
+                val dstX = (tx - barLeft).toInt()
+                val dstY = (ty - barTop).toInt()
+                val dstW = tw.toInt().coerceAtLeast(1)
+                val dstH = th.toInt().coerceAtLeast(1)
+                if (keyStr.startsWith("header_")) {
+                    drawRect(
+                        color = Color(0xFFD4AF37).copy(alpha = 0.65f * effAlpha),
+                        topLeft = Offset(dstX + 8.dp.toPx(), dstY + (dstH * 0.3f)),
+                        size = ComposeSize(minOf(dstW.toFloat() * 0.35f, 120.dp.toPx()), (dstH * 0.45f).coerceAtLeast(8f))
+                    )
+                } else if (keyStr != "gallery_stats_header") {
+                    val bmp = ThumbBitmapCache.getBlurred(keyStr) ?: ThumbBitmapCache.get(keyStr)
+                    if (bmp != null) {
+                        val bw = bmp.width
+                        val bh = bmp.height
+                        val edge = minOf(bw, bh).coerceAtLeast(1)
+                        val srcX = (bw - edge) / 2
+                        val srcY = (bh - edge) / 2
+                        drawImage(
+                            image = bmp,
+                            srcOffset = IntOffset(srcX, srcY),
+                            srcSize = IntSize(edge, edge),
+                            dstOffset = IntOffset(dstX, dstY),
+                            dstSize = IntSize(dstW, dstH),
+                            alpha = effAlpha,
+                            filterQuality = FilterQuality.Medium
+                        )
+                    } else {
+                        drawRect(
+                            color = Color(0xFF2D3033).copy(alpha = effAlpha),
+                            topLeft = Offset(dstX.toFloat(), dstY.toFloat()),
+                            size = ComposeSize(dstW.toFloat(), dstH.toFloat())
+                        )
+                    }
+                }
+            }
+        }
+    } else {
+        for ((encName, b) in boundsMap) {
+            if (excludeEncryptedName != null && encName == excludeEncryptedName) continue
+            if (b.size < 4) continue
+            val tx = b[0]
+            val ty = b[1]
+            val tw = b[2]
+            val th = b[3]
+            if (tx + tw >= barLeft - 24f && tx <= barRight + 24f &&
+                ty + th >= barTop - 24f && ty <= barBottom + 24f
+            ) {
+                val bmp = ThumbBitmapCache.getBlurred(encName) ?: ThumbBitmapCache.get(encName) ?: continue
+                val bw = bmp.width
+                val bh = bmp.height
+                val edge = minOf(bw, bh).coerceAtLeast(1)
+                drawImage(
+                    image = bmp,
+                    srcOffset = IntOffset((bw - edge) / 2, (bh - edge) / 2),
+                    srcSize = IntSize(edge, edge),
+                    dstOffset = IntOffset((tx - barLeft).toInt(), (ty - barTop).toInt()),
+                    dstSize = IntSize(tw.toInt().coerceAtLeast(1), th.toInt().coerceAtLeast(1)),
+                    alpha = effAlpha,
+                    filterQuality = FilterQuality.Medium
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Header thống kê số lượng secure files, photos và videos nằm độc lập ở phía trên cùng của khu vực thumbnail.
+ * Đảm bảo khoảng cách an toàn phía trên để không bị camera đục lỗ (punch-hole / display cutout) che khuất.
+ */
+@Composable
+fun GalleryStatsHeader(
+    totalFiles: Int,
+    photoCount: Int,
+    videoCount: Int,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Top))
+            .padding(start = 8.dp, top = 28.dp, end = 8.dp, bottom = 10.dp)
+            .testTag("gallery_stats_header")
+    ) {
+        Text(
+            text = "$totalFiles secure files",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.testTag("gallery_stats_total_text")
+        )
+        Spacer(modifier = Modifier.height(3.dp))
+        Text(
+            text = "$photoCount photos · $videoCount videos",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.testTag("gallery_stats_breakdown_text")
+        )
+    }
+}
+
+/**
+ * Floating Bar dùng chung cho cả GalleryScreen và MediaViewerScreen:
+ * - Chiều rộng (width) của bar ở trạng thái thu gọn co dãn linh hoạt theo đúng số lượng icon hiện có trong bar
+ *   bằng spring(dampingRatio = 0.7f, stiffness = 300f).
+ * - Hiệu ứng chuyển đổi các icon khi chuyển qua lại giữa Grid và Full Screen (hoặc khi bật/tắt chế độ chọn,
+ *   vuốt qua ảnh Live Photo) diễn ra mượt mà bằng spring animation, không bao giờ bị biến mất 1 nhoáng.
+ * - Hiệu ứng background blur thực sự (Modifier.blur + vẽ trực tiếp nội dung phía sau bar theo toạ độ cửa sổ thực tế)
+ *   kết hợp nền xám trong suốt (alpha = 0.36f), không sử dụng viền (border).
+ * - Khi nhấn Download: mở rộng mượt mà bằng spring(dampingRatio = 0.7f, stiffness = 300f) thành panel tỷ lệ 16:9
+ *   với hàng tiêu đề (icon Download + "Confirm download") và 2 nút hành động (Cancel / OK -> Close / Show in folder).
+ */
+@Composable
+fun GalleryFloatingBar(
+    barState: FloatingBarState,
+    onBarStateChange: (FloatingBarState) -> Unit,
+    onConfirmDownload: () -> Unit,
+    onCancelDownload: () -> Unit,
+    onShowInFolder: () -> Unit,
+    onLiveClick: () -> Unit = {},
+    onAddClick: () -> Unit = {},
+    isAddMenuExpanded: Boolean = false,
+    isViewerMode: Boolean = false,
+    isClosingToGrid: Boolean = false,
+    isBarActive: Boolean = true,
+    showLiveButton: Boolean = false,
+    isSelectionMode: Boolean = false,
+    isFullVaultSelected: Boolean = false,
+    hasSelectedItems: Boolean = false,
+    downloadProgress: Float = 0f,
+    onRefreshClick: () -> Unit = {},
+    onToggleSelectAll: () -> Unit = {},
+    onDeleteClick: () -> Unit = {},
+    onToggleSelectionMode: () -> Unit = {},
+    onInfoClick: () -> Unit = {},
+    drawBackdrop: (DrawScope.(barLeftInWindow: Float, barTopInWindow: Float) -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val barYellow = MaterialTheme.colorScheme.primary
+
+    // Duy nhất 1 Animatable điều khiển kích thước đóng/mở của Floating Bar (từ pill thu gọn <-> panel 16:9)
+    val expansionProgress = remember { Animatable(0f) }
+
+    // Các Animatable điều khiển co dãn chiều rộng & chuyển đổi icon bằng spring animation liền mạch giữa Grid và Full Screen
+    val viewerMorphAnim = remember {
+        Animatable(FloatingBarSharedState.viewerMorphProgress)
+    }
+    val liveSlotAnim = remember {
+        Animatable(FloatingBarSharedState.liveSlotProgress)
+    }
+    val selectionModeAnim = remember {
+        Animatable(FloatingBarSharedState.selectionModeProgress)
+    }
+    val deleteSelectedSlotAnim = remember {
+        Animatable(FloatingBarSharedState.deleteSelectedSlotProgress)
+    }
+
+    val targetViewerMorph = if (isViewerMode && !isClosingToGrid) 1f else 0f
+    val targetLiveSlot = if (isViewerMode && !isClosingToGrid && showLiveButton) 1f else 0f
+    val effectiveSelectionMode = if (isViewerMode) FloatingBarSharedState.lastIsSelectionMode else isSelectionMode
+    val effectiveFullVaultSelected = if (isViewerMode) FloatingBarSharedState.lastIsFullVaultSelected else isFullVaultSelected
+    val effectiveHasSelectedItems = if (isViewerMode) FloatingBarSharedState.lastHasSelectedItems else hasSelectedItems
+    val targetSelectionMode = if (!isViewerMode && isSelectionMode) 1f else if (isViewerMode && isClosingToGrid && effectiveSelectionMode) 1f else 0f
+    val targetDeleteSelected = if (!isViewerMode && isSelectionMode && hasSelectedItems) 1f else if (isViewerMode && isClosingToGrid && effectiveSelectionMode && effectiveHasSelectedItems) 1f else 0f
+
+    LaunchedEffect(isBarActive, targetViewerMorph) {
+        if (!isBarActive) return@LaunchedEffect
+        val sharedVal = FloatingBarSharedState.viewerMorphProgress
+        if (abs(viewerMorphAnim.value - sharedVal) > 0.01f) {
+            viewerMorphAnim.snapTo(sharedVal)
+        }
+        viewerMorphAnim.animateTo(
+            targetValue = targetViewerMorph,
+            animationSpec = floatingBarSpring()
+        )
+    }
+
+    LaunchedEffect(isBarActive, targetLiveSlot) {
+        if (!isBarActive) return@LaunchedEffect
+        val sharedVal = FloatingBarSharedState.liveSlotProgress
+        if (abs(liveSlotAnim.value - sharedVal) > 0.01f) {
+            liveSlotAnim.snapTo(sharedVal)
+        }
+        liveSlotAnim.animateTo(
+            targetValue = targetLiveSlot,
+            animationSpec = floatingBarSpring()
+        )
+    }
+
+    LaunchedEffect(isBarActive, targetSelectionMode) {
+        if (!isBarActive) return@LaunchedEffect
+        val sharedVal = FloatingBarSharedState.selectionModeProgress
+        if (abs(selectionModeAnim.value - sharedVal) > 0.01f) {
+            selectionModeAnim.snapTo(sharedVal)
+        }
+        selectionModeAnim.animateTo(
+            targetValue = targetSelectionMode,
+            animationSpec = floatingBarSpring()
+        )
+    }
+
+    LaunchedEffect(isBarActive, targetDeleteSelected) {
+        if (!isBarActive) return@LaunchedEffect
+        val sharedVal = FloatingBarSharedState.deleteSelectedSlotProgress
+        if (abs(deleteSelectedSlotAnim.value - sharedVal) > 0.01f) {
+            deleteSelectedSlotAnim.snapTo(sharedVal)
+        }
+        deleteSelectedSlotAnim.animateTo(
+            targetValue = targetDeleteSelected,
+            animationSpec = floatingBarSpring()
+        )
+    }
+
+    SideEffect {
+        if (isBarActive) {
+            FloatingBarSharedState.viewerMorphProgress = viewerMorphAnim.value
+            FloatingBarSharedState.liveSlotProgress = liveSlotAnim.value
+            FloatingBarSharedState.selectionModeProgress = selectionModeAnim.value
+            FloatingBarSharedState.deleteSelectedSlotProgress = deleteSelectedSlotAnim.value
+            if (!isViewerMode) {
+                FloatingBarSharedState.lastIsSelectionMode = isSelectionMode
+                FloatingBarSharedState.lastIsFullVaultSelected = isFullVaultSelected
+                FloatingBarSharedState.lastHasSelectedItems = hasSelectedItems
+            }
+        }
+    }
+
+    // Giữ chế độ hiển thị của panel mở rộng trong suốt quá trình thu gọn để không bị nhảy layout khi đang đóng
+    var activeExpandedMode by remember {
+        mutableStateOf(
+            if (barState == FloatingBarState.COLLAPSED) FloatingBarState.CONFIRM_DOWNLOAD else barState
+        )
+    }
+    if (barState != FloatingBarState.COLLAPSED) {
+        activeExpandedMode = barState
+    }
+
+    LaunchedEffect(barState) {
+        val target = if (barState == FloatingBarState.COLLAPSED) 0f else 1f
+        if (target == 1f && expansionProgress.value <= 0.001f) {
+            expansionProgress.snapTo(0f)
+        }
+        expansionProgress.animateTo(
+            targetValue = target,
+            animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f)
+        )
+        if (target == 0f) {
+            expansionProgress.snapTo(0f)
+            activeExpandedMode = FloatingBarState.CONFIRM_DOWNLOAD
+        }
+    }
+
+    val completedTransition by animateFloatAsState(
+        targetValue = if (activeExpandedMode == FloatingBarState.DOWNLOAD_COMPLETED) 1f else 0f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f),
+        label = "floating_bar_completed_transition"
+    )
+
+    val addIconRotation by animateFloatAsState(
+        targetValue = if (isAddMenuExpanded) 45f else 0f,
+        animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f),
+        label = "floating_bar_add_rotation"
+    )
+
+    var containerCenterX by remember { mutableFloatStateOf(FloatingBarSharedState.lastCenterX) }
+    var containerBottomY by remember { mutableFloatStateOf(FloatingBarSharedState.lastBottomY) }
+    var barWindowX by remember { mutableFloatStateOf(FloatingBarSharedState.lastWindowX) }
+    var barWindowY by remember { mutableFloatStateOf(FloatingBarSharedState.lastWindowY) }
+
+    val screenWidthPx = context.resources.displayMetrics.widthPixels.toFloat()
+    val screenHeightPx = context.resources.displayMetrics.heightPixels.toFloat()
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .onGloballyPositioned { coordinates ->
+                val pos = coordinates.positionInWindow()
+                val sz = coordinates.size
+                if (sz.width > 0 && sz.height > 0) {
+                    val cx = pos.x + sz.width / 2f
+                    val by = pos.y + sz.height.toFloat()
+                    containerCenterX = cx
+                    containerBottomY = by
+                    if (isBarActive) {
+                        FloatingBarSharedState.lastCenterX = cx
+                        FloatingBarSharedState.lastBottomY = by
+                    }
+                }
+            },
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        val fullWidthPx = constraints.maxWidth.toFloat().coerceAtLeast(1f)
+        val collapsedHeightPx = with(density) { 48.dp.toPx() }
+        // Tỷ lệ khung hình chính xác 16:9 khi mở rộng (tương tự tỷ lệ mini map trong Details Sheet)
+        val expandedHeightPx = fullWidthPx * (9f / 16f)
+
+        val viewerMorph = viewerMorphAnim.value
+        val liveProg = liveSlotAnim.value
+        val selProg = selectionModeAnim.value
+        val delSelProg = deleteSelectedSlotAnim.value
+
+        // Tính chiều rộng thu gọn (collapsed width) co dãn linh hoạt theo đúng số lượng icon hiện có bằng spring:
+        // - Mỗi icon tiêu chuẩn rộng 48.dp, khoảng cách giữa các icon là 4.dp
+        // - 3 icon tiêu chuẩn: 48*3 + 4*2 = 152.dp
+        // - 4 icon tiêu chuẩn (có thêm icon Live hoặc Delete): 152.dp + 52.dp = 204.dp
+        // - Chế độ chọn (DoneAll + ALL/NONE rộng 84.dp = 48.dp + 36.dp): 152.dp + 36.dp (+ 52.dp khi có mục được chọn)
+        val gridCollapsedWidthDp = 152.dp + (36.dp * selProg) + (52.dp * delSelProg)
+        val viewerCollapsedWidthDp = 152.dp + (52.dp * liveProg)
+        val collapsedWidthDp = (gridCollapsedWidthDp + (viewerCollapsedWidthDp - gridCollapsedWidthDp) * viewerMorph)
+            .coerceAtLeast(132.dp)
+        val collapsedWidthPx = with(density) { collapsedWidthDp.toPx() }.coerceAtMost(fullWidthPx)
+
+        val t = expansionProgress.value
+        val currentWidthPx = (collapsedWidthPx + (fullWidthPx - collapsedWidthPx) * t)
+            .coerceIn(collapsedWidthPx * 0.85f, fullWidthPx * 1.04f)
+        val currentHeightPx = (collapsedHeightPx + (expandedHeightPx - collapsedHeightPx) * t)
+            .coerceAtLeast(collapsedHeightPx * 0.85f)
+        val currentWidthDp = with(density) { currentWidthPx.toDp() }
+        val currentHeightDp = with(density) { currentHeightPx.toDp() }
+
+        val clampedT = t.coerceIn(0f, 1f)
+        val currentCornerDp = (24f - 6f * clampedT).dp
+        val barShape = RoundedCornerShape(currentCornerDp)
+
+        val collapsedContentAlpha = (1f - clampedT * 2.5f).coerceIn(0f, 1f)
+        val expandedContentAlpha = ((clampedT - 0.18f) / 0.82f).coerceIn(0f, 1f)
+
+        Box(
+            modifier = Modifier
+                .width(currentWidthDp)
+                .height(currentHeightDp)
+                .onGloballyPositioned { coordinates ->
+                    val pos = coordinates.positionInWindow()
+                    barWindowX = pos.x
+                    barWindowY = pos.y
+                    if (isBarActive) {
+                        FloatingBarSharedState.lastWindowX = pos.x
+                        FloatingBarSharedState.lastWindowY = pos.y
+                    }
+                }
+                .clip(barShape)
+                .clickable(
+                    interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                    indication = null
+                ) { /* Chặn sự kiện chạm xuyên qua floating bar xuống lớp bên dưới */ }
+                .testTag(if (isViewerMode) "viewer_floating_bar" else "gallery_floating_bar")
+        ) {
+            // Lớp 1: Hiệu ứng Background Blur thực sự (làm mờ nội dung thực phía sau bar với nền đen đặc chặn hoàn toàn ảnh sắc nét bên dưới lộ lên)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .blur(radius = 24.dp, edgeTreatment = BlurredEdgeTreatment.Rectangle)
+            ) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    drawRect(color = Color.Black)
+                    val effCenterX = when {
+                        containerCenterX > 0f -> containerCenterX
+                        FloatingBarSharedState.lastCenterX > 0f -> FloatingBarSharedState.lastCenterX
+                        else -> screenWidthPx / 2f
+                    }
+                    val effBottomY = when {
+                        containerBottomY > 0f -> containerBottomY
+                        FloatingBarSharedState.lastBottomY > 0f -> FloatingBarSharedState.lastBottomY
+                        else -> screenHeightPx - 24.dp.toPx()
+                    }
+                    val exactBarLeft = effCenterX - size.width / 2f
+                    val exactBarTop = effBottomY - size.height
+                    drawBackdrop?.invoke(this, exactBarLeft, exactBarTop)
+                }
+            }
+
+            // Lớp phủ xám trong suốt (tăng nhẹ alpha lên 0.36f) tạo bề mặt kính mờ rõ nét, tinh tế, không viền
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xFF38383C).copy(alpha = 0.36f))
+            )
+
+            // Lớp 2: Nội dung trạng thái thu gọn (COLLAPSED) với chuyển tiếp icon bằng spring giữa Grid và Full Screen
+            if (collapsedContentAlpha > 0.001f) {
+                val gridLayerAlpha = ((1f - viewerMorph * 1.15f).coerceIn(0f, 1f) * collapsedContentAlpha).coerceIn(0f, 1f)
+                val gridLayerScale = (0.58f + 0.42f * (1f - viewerMorph)).coerceIn(0.45f, 1.12f)
+
+                val viewerLayerAlpha = (((viewerMorph - 0.10f) / 0.90f).coerceIn(0f, 1f) * collapsedContentAlpha).coerceIn(0f, 1f)
+                val viewerLayerScale = (0.58f + 0.42f * viewerMorph).coerceIn(0.45f, 1.12f)
+
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    // Cụm icon của Grid (!isViewerMode hoặc đang trong quá trình morph đóng/mở)
+                    if (!isViewerMode || gridLayerAlpha > 0.004f) {
+                        val leftSlotWidthDp = 48.dp + (36.dp * selProg.coerceAtLeast(0f))
+                        val refreshAlpha = ((1f - selProg * 1.2f).coerceIn(0f, 1f) * gridLayerAlpha).coerceIn(0f, 1f)
+                        val refreshScale = ((0.6f + 0.4f * (1f - selProg)).coerceIn(0.45f, 1.12f) * gridLayerScale)
+                        val selectAllAlpha = (((selProg - 0.1f) / 0.9f).coerceIn(0f, 1f) * gridLayerAlpha).coerceIn(0f, 1f)
+                        val selectAllScale = ((0.6f + 0.4f * selProg).coerceIn(0.45f, 1.12f) * gridLayerScale)
+
+                        Row(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            // Vị trí 1 (Cạnh trái): Refresh <-> Select All (ALL / NONE)
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .width(leftSlotWidthDp)
+                                    .height(48.dp)
+                            ) {
+                                if (!effectiveSelectionMode || refreshAlpha > 0.004f) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier
+                                            .requiredSize(48.dp)
+                                            .graphicsLayer {
+                                                alpha = refreshAlpha
+                                                scaleX = refreshScale
+                                                scaleY = refreshScale
+                                            }
+                                            .then(
+                                                if (!isViewerMode && !effectiveSelectionMode) {
+                                                    Modifier
+                                                        .clickable { onRefreshClick() }
+                                                        .testTag("refresh_button")
+                                                } else Modifier
+                                            )
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Refresh,
+                                            contentDescription = "Refresh Grid",
+                                            tint = barYellow,
+                                            modifier = Modifier.size(26.dp)
+                                        )
+                                    }
+                                }
+
+                                if (effectiveSelectionMode || selectAllAlpha > 0.004f) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center,
+                                        modifier = Modifier
+                                            .width(84.dp)
+                                            .height(48.dp)
+                                            .graphicsLayer {
+                                                alpha = selectAllAlpha
+                                                scaleX = selectAllScale
+                                                scaleY = selectAllScale
+                                            }
+                                            .then(
+                                                if (!isViewerMode && effectiveSelectionMode) {
+                                                    Modifier
+                                                        .clickable { onToggleSelectAll() }
+                                                        .testTag("select_full_vault_button")
+                                                } else Modifier
+                                            )
+                                            .padding(horizontal = 8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.DoneAll,
+                                            contentDescription = "Select Full Vault",
+                                            tint = barYellow,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = if (effectiveFullVaultSelected) "NONE" else "ALL",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = barYellow,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.width(4.dp))
+
+                            // Vị trí 2 (Giữa): Nút dấu cộng (+) Import Media
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .graphicsLayer {
+                                        alpha = gridLayerAlpha
+                                        scaleX = gridLayerScale
+                                        scaleY = gridLayerScale
+                                    }
+                                    .then(
+                                        if (!isViewerMode) {
+                                            Modifier
+                                                .clickable { onAddClick() }
+                                                .testTag("import_fab")
+                                        } else Modifier
+                                    )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Add,
+                                    contentDescription = "Import Media Menu",
+                                    tint = barYellow,
+                                    modifier = Modifier
+                                        .size(28.dp)
+                                        .graphicsLayer {
+                                            rotationZ = addIconRotation
+                                        }
+                                )
+                            }
+
+                            // Vị trí 3 (Tuỳ chọn khi có mục được chọn): Nút xoá các mục đã chọn
+                            val clampedDelSelWidth = delSelProg.coerceAtLeast(0f)
+                            if ((effectiveSelectionMode && effectiveHasSelectedItems) || clampedDelSelWidth > 0.004f) {
+                                Spacer(modifier = Modifier.width(4.dp * clampedDelSelWidth))
+                                val delAlpha = (delSelProg.coerceIn(0f, 1f) * gridLayerAlpha).coerceIn(0f, 1f)
+                                val delScale = ((0.55f + 0.45f * delSelProg).coerceIn(0.4f, 1.12f) * gridLayerScale)
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .width((48.dp * clampedDelSelWidth).coerceAtLeast(if (!isViewerMode && effectiveSelectionMode && effectiveHasSelectedItems) 1.dp else 0.dp))
+                                        .height(48.dp)
+                                ) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier
+                                            .requiredSize(48.dp)
+                                            .graphicsLayer {
+                                                alpha = delAlpha
+                                                scaleX = delScale
+                                                scaleY = delScale
+                                            }
+                                            .then(
+                                                if (!isViewerMode && effectiveSelectionMode && effectiveHasSelectedItems) {
+                                                    Modifier
+                                                        .clickable { onDeleteClick() }
+                                                        .testTag("delete_selected_button")
+                                                } else Modifier
+                                            )
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Delete,
+                                            contentDescription = "Delete Selected",
+                                            tint = barYellow,
+                                            modifier = Modifier.size(26.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.width(4.dp))
+
+                            // Vị trí cuối (Cạnh phải): Nút Edit <-> Close Selection
+                            val editAlpha = ((1f - selProg * 1.2f).coerceIn(0f, 1f) * gridLayerAlpha).coerceIn(0f, 1f)
+                            val editScale = ((0.6f + 0.4f * (1f - selProg)).coerceIn(0.45f, 1.12f) * gridLayerScale)
+                            val closeSelAlpha = (((selProg - 0.1f) / 0.9f).coerceIn(0f, 1f) * gridLayerAlpha).coerceIn(0f, 1f)
+                            val closeSelScale = ((0.6f + 0.4f * selProg).coerceIn(0.45f, 1.12f) * gridLayerScale)
+
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .then(
+                                        if (!isViewerMode) {
+                                            Modifier
+                                                .clickable { onToggleSelectionMode() }
+                                                .testTag("choose_edit_button")
+                                        } else Modifier
+                                    )
+                            ) {
+                                if (!effectiveSelectionMode || editAlpha > 0.004f) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Edit,
+                                        contentDescription = "Choose Items",
+                                        tint = barYellow,
+                                        modifier = Modifier
+                                            .size(26.dp)
+                                            .graphicsLayer {
+                                                alpha = editAlpha
+                                                scaleX = editScale
+                                                scaleY = editScale
+                                            }
+                                    )
+                                }
+                                if (effectiveSelectionMode || closeSelAlpha > 0.004f) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Cancel Selection",
+                                        tint = barYellow,
+                                        modifier = Modifier
+                                            .size(26.dp)
+                                            .graphicsLayer {
+                                                alpha = closeSelAlpha
+                                                scaleX = closeSelScale
+                                                scaleY = closeSelScale
+                                            }
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Cụm icon của Full Screen Viewer (isViewerMode hoặc đang trong quá trình morph đóng/mở)
+                    if (isViewerMode || viewerLayerAlpha > 0.004f) {
+                        Row(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            // Vị trí 0 (Tuỳ chọn khi xem ảnh Live Photo): Nút Live co dãn bằng spring
+                            val clampedLiveWidth = liveProg.coerceAtLeast(0f)
+                            if (showLiveButton || clampedLiveWidth > 0.004f) {
+                                val liveIconAlpha = (liveProg.coerceIn(0f, 1f) * viewerLayerAlpha).coerceIn(0f, 1f)
+                                val liveIconScale = ((0.55f + 0.45f * liveProg).coerceIn(0.4f, 1.12f) * viewerLayerScale)
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .width((48.dp * clampedLiveWidth).coerceAtLeast(if (isViewerMode && showLiveButton) 1.dp else 0.dp))
+                                        .height(48.dp)
+                                ) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier
+                                            .requiredSize(48.dp)
+                                            .graphicsLayer {
+                                                alpha = liveIconAlpha
+                                                scaleX = liveIconScale
+                                                scaleY = liveIconScale
+                                            }
+                                            .then(
+                                                if (isViewerMode && showLiveButton) {
+                                                    Modifier
+                                                        .clickable { onLiveClick() }
+                                                        .testTag("live_photo_badge_button")
+                                                } else Modifier
+                                            )
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.MotionPhotosOn,
+                                            contentDescription = "Play Live Once",
+                                            tint = barYellow,
+                                            modifier = Modifier.size(26.dp)
+                                        )
+                                    }
+                                }
+                                Spacer(modifier = Modifier.width(4.dp * clampedLiveWidth))
+                            }
+
+                            // Vị trí 1: Nút Download
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .graphicsLayer {
+                                        alpha = viewerLayerAlpha
+                                        scaleX = viewerLayerScale
+                                        scaleY = viewerLayerScale
+                                    }
+                                    .then(
+                                        if (isViewerMode) {
+                                            Modifier
+                                                .clickable {
+                                                    onBarStateChange(FloatingBarState.CONFIRM_DOWNLOAD)
+                                                }
+                                                .testTag("export_selected_button")
+                                        } else Modifier
+                                    )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.FileDownload,
+                                    contentDescription = "Download",
+                                    tint = barYellow,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(4.dp))
+
+                            // Vị trí 2: Nút Info (Details)
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .graphicsLayer {
+                                        alpha = viewerLayerAlpha
+                                        scaleX = viewerLayerScale
+                                        scaleY = viewerLayerScale
+                                    }
+                                    .then(
+                                        if (isViewerMode) {
+                                            Modifier
+                                                .clickable { onInfoClick() }
+                                                .testTag("viewer_info_button")
+                                        } else Modifier
+                                    )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Info,
+                                    contentDescription = "File Properties",
+                                    tint = barYellow,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(4.dp))
+
+                            // Vị trí 3: Nút Delete
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .graphicsLayer {
+                                        alpha = viewerLayerAlpha
+                                        scaleX = viewerLayerScale
+                                        scaleY = viewerLayerScale
+                                    }
+                                    .then(
+                                        if (isViewerMode) {
+                                            Modifier
+                                                .clickable { onDeleteClick() }
+                                                .testTag("viewer_delete_button")
+                                        } else Modifier
+                                    )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Delete,
+                                    contentDescription = "Delete File",
+                                    tint = barYellow,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Lớp 3: Nội dung Panel xác nhận tải xuống 16:9 (CONFIRM_DOWNLOAD / DOWNLOADING / DOWNLOAD_COMPLETED)
+            if (expandedContentAlpha > 0.001f) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            alpha = expandedContentAlpha
+                            transformOrigin = TransformOrigin(0.5f, 1f)
+                        }
+                        .padding(horizontal = 20.dp, vertical = 18.dp)
+                        .testTag("download_confirmation_panel"),
+                    verticalArrangement = Arrangement.SpaceBetween,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    // 1. Hàng tiêu đề ở phía trên: gồm icon Download nằm bên trái và text "Confirm download" ngay bên cạnh cùng hàng
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.FileDownload,
+                            contentDescription = "Confirm download",
+                            tint = barYellow,
+                            modifier = Modifier.size(26.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Confirm download",
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = barYellow,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("confirm_download_title")
+                        )
+                    }
+
+                    if (activeExpandedMode == FloatingBarState.DOWNLOADING) {
+                        val pct = (downloadProgress.coerceIn(0f, 1f) * 100).toInt()
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            CircularProgressIndicator(
+                                color = barYellow,
+                                strokeWidth = 2.5.dp,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "Downloading... $pct%",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = barYellow
+                            )
+                        }
+                    }
+
+                    // 2. Hai nút hành động ở phía dưới:
+                    //    - Trước khi hoàn tất: Cancel (nền trắng có alpha) và OK (nền vàng solid, chữ/icon tương phản rõ)
+                    //    - Khi tải thành công: Close (nền trắng có alpha) và Show in folder (nền vàng solid)
+                    Box(
+                        modifier = Modifier.fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val confirmButtonsAlpha = (1f - completedTransition * 2f).coerceIn(0f, 1f)
+                        val completedButtonsAlpha = ((completedTransition - 0.3f) / 0.7f).coerceIn(0f, 1f)
+
+                        if (confirmButtonsAlpha > 0.001f) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .graphicsLayer {
+                                        alpha = confirmButtonsAlpha
+                                        val s = 0.92f + 0.08f * confirmButtonsAlpha
+                                        scaleX = s
+                                        scaleY = s
+                                    },
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Cancel: nền trắng có alpha, không dùng nền trắng đục
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(50.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(Color.White.copy(alpha = 0.16f))
+                                        .clickable {
+                                            onCancelDownload()
+                                        }
+                                        .testTag("download_cancel_button")
+                                ) {
+                                    Text(
+                                        text = "Cancel",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                }
+
+                                // OK: nền vàng solid, text và icon có độ tương phản rõ ràng
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(50.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(barYellow)
+                                        .clickable(enabled = activeExpandedMode != FloatingBarState.DOWNLOADING) {
+                                            onConfirmDownload()
+                                        }
+                                        .testTag("download_ok_button")
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Check,
+                                            contentDescription = null,
+                                            tint = Color.Black,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "OK",
+                                            fontSize = 15.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.Black
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if (completedButtonsAlpha > 0.001f) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .graphicsLayer {
+                                        alpha = completedButtonsAlpha
+                                        val s = 0.92f + 0.08f * completedButtonsAlpha
+                                        scaleX = s
+                                        scaleY = s
+                                    },
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Close: đóng trạng thái hoàn tất và đưa giao diện trở về floating bar thu gọn
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(50.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(Color.White.copy(alpha = 0.16f))
+                                        .clickable {
+                                            onBarStateChange(FloatingBarState.COLLAPSED)
+                                        }
+                                        .testTag("download_close_button")
+                                ) {
+                                    Text(
+                                        text = "Close",
+                                        fontSize = 15.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                }
+
+                                // Show in folder: mở đúng vị trí lưu file vừa tải xuống
+                                Box(
+                                    contentAlignment = Alignment.Center,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(50.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(barYellow)
+                                        .clickable {
+                                            onShowInFolder()
+                                        }
+                                        .testTag("download_show_in_folder_button")
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.Center,
+                                        modifier = Modifier.padding(horizontal = 8.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.FolderOpen,
+                                            contentDescription = null,
+                                            tint = Color.Black,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "Show in folder",
+                                            fontSize = 14.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.Black,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun GalleryScreen(
@@ -509,7 +1615,6 @@ fun GalleryScreen(
     val density = LocalDensity.current
 
     val items by viewModel.items.collectAsState()
-    val vaultUri by viewModel.vaultUri.collectAsState()
     val dek by viewModel.dek.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val importProgress by viewModel.importProgress.collectAsState()
@@ -524,6 +1629,10 @@ fun GalleryScreen(
     val videoFramePickRequest by viewModel.videoFramePickRequest.collectAsState()
     val error by viewModel.error.collectAsState()
     val animatingItem by viewModel.animatingItem.collectAsState()
+    val selectedMedia by viewModel.selectedMedia.collectAsState()
+    val boundsMap by viewModel.thumbnailBounds.collectAsState()
+    var gridWindowX by remember { mutableFloatStateOf(0f) }
+    var gridWindowY by remember { mutableFloatStateOf(0f) }
 
     // Làm mượt phần trăm tiến độ mã hoá (chạy mượt cả đường viền vuông lẫn con số %)
     val smoothImportProgress by animateFloatAsState(
@@ -535,8 +1644,15 @@ fun GalleryScreen(
     var isSelectionMode by remember { mutableStateOf(false) }
     var selectedEncryptedNames by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showBulkDeleteDialog by remember { mutableStateOf(false) }
-    var showBulkExportDialog by remember { mutableStateOf(false) }
     var isImportMenuExpanded by remember { mutableStateOf(false) }
+    var floatingBarState by remember { mutableStateOf(FloatingBarState.COLLAPSED) }
+
+    // Trạng thái phát Live Photo 1 lần duy nhất khi bấm icon Live trên floating bar
+    var oneShotLiveItemKey by remember { mutableStateOf<String?>(null) }
+    var oneShotLiveTriggerId by remember { mutableIntStateOf(0) }
+
+    val videoCount = remember(items) { items.count { it.isVideo } }
+    val photoCount = remember(items, videoCount) { (items.size - videoCount).coerceAtLeast(0) }
 
     val orderedKeys = remember(items) { items.map { it.encryptedName } }
     val keyToIndexMap = remember(orderedKeys) {
@@ -569,6 +1685,12 @@ fun GalleryScreen(
 
     BackHandler {
         when {
+            floatingBarState != FloatingBarState.COLLAPSED -> {
+                if (floatingBarState == FloatingBarState.DOWNLOADING) {
+                    viewModel.cancelImport()
+                }
+                floatingBarState = FloatingBarState.COLLAPSED
+            }
             isImportMenuExpanded -> {
                 isImportMenuExpanded = false
             }
@@ -597,9 +1719,6 @@ fun GalleryScreen(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { _ -> }
 
-    // Để giữ được GPS khi import cần ĐỦ cả 2 quyền:
-    //  - READ_MEDIA_IMAGES/VIDEO (Android 13+) hoặc READ_EXTERNAL_STORAGE (<13): mở được Uri MediaStore gốc
-    //  - ACCESS_MEDIA_LOCATION: hệ thống không xoá EXIF/ISO-6709 GPS khỏi bản gốc
     LaunchedEffect(Unit) {
         try {
             val wanted = mutableListOf<String>()
@@ -646,304 +1765,16 @@ fun GalleryScreen(
         }
     }
 
-    val folderName = remember(vaultUri) {
-        val raw = vaultUri?.lastPathSegment?.substringAfterLast(':') ?: "Vault"
-        raw.trim('/').substringAfterLast('/').ifEmpty { raw }
-    }
-
     Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text(
-                            text = folderName.uppercase(),
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        val subtitleText = if (isSelectionMode) {
-                            "${selectedEncryptedNames.size} / ${items.size} selected"
-                        } else {
-                            "${items.size} secure files"
-                        }
-                        val subtitleColor by animateColorAsState(
-                            targetValue = if (isSelectionMode && selectedEncryptedNames.isNotEmpty()) {
-                                MaterialTheme.colorScheme.primary
-                            } else {
-                                MaterialTheme.colorScheme.onSurfaceVariant
-                            },
-                            animationSpec = tween(200),
-                            label = "subtitle_color"
-                        )
-                        AnimatedContent(
-                            targetState = subtitleText,
-                            transitionSpec = {
-                                fadeIn(tween(150)).togetherWith(fadeOut(tween(120)))
-                            },
-                            label = "subtitle_text_anim"
-                        ) { textVal ->
-                            Text(
-                                text = textVal,
-                                fontSize = 11.sp,
-                                color = subtitleColor
-                            )
-                        }
-                    }
-                },
-                actions = {
-                    AnimatedVisibility(
-                        visible = isSelectionMode && items.isNotEmpty(),
-                        enter = fadeIn(tween(180)) + scaleIn(initialScale = 0.85f, animationSpec = tween(180)),
-                        exit = fadeOut(tween(140)) + scaleOut(targetScale = 0.85f, animationSpec = tween(140))
-                    ) {
-                        TextButton(
-                            onClick = {
-                                selectedEncryptedNames = if (isFullVaultSelected) {
-                                    emptySet()
-                                } else {
-                                    orderedKeys.toSet()
-                                }
-                            },
-                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                            modifier = Modifier.testTag("select_full_vault_button")
-                        ) {
-                            val tintColor by animateColorAsState(
-                                targetValue = if (isFullVaultSelected) {
-                                    MaterialTheme.colorScheme.primary
-                                } else {
-                                    MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                                animationSpec = tween(180),
-                                label = "all_btn_tint"
-                            )
-                            Icon(
-                                imageVector = Icons.Filled.DoneAll,
-                                contentDescription = "Select Full Vault",
-                                tint = tintColor,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = if (isFullVaultSelected) "NONE" else "ALL",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = if (isFullVaultSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    }
-
-                    val showSelectionActions = isSelectionMode && selectedEncryptedNames.isNotEmpty()
-                    AnimatedContent(
-                        targetState = showSelectionActions,
-                        transitionSpec = {
-                            (fadeIn(tween(180)) + scaleIn(initialScale = 0.75f, animationSpec = spring(dampingRatio = 0.7f)))
-                                .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.75f, animationSpec = tween(140)))
-                        },
-                        label = "refresh_or_selection_actions"
-                    ) { hasSelectedItems ->
-                        if (hasSelectedItems) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = { showBulkExportDialog = true },
-                                    modifier = Modifier.testTag("export_selected_button")
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.FileDownload,
-                                        contentDescription = "Export Selected",
-                                        tint = MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                                IconButton(
-                                    onClick = { showBulkDeleteDialog = true },
-                                    modifier = Modifier.testTag("delete_selected_button")
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Delete,
-                                        contentDescription = "Delete Selected",
-                                        tint = MaterialTheme.colorScheme.error
-                                    )
-                                }
-                            }
-                        } else {
-                            IconButton(
-                                onClick = { viewModel.loadVaultItems(context) },
-                                modifier = Modifier.testTag("refresh_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Refresh,
-                                    contentDescription = "Refresh Grid"
-                                )
-                            }
-                        }
-                    }
-
-                    IconButton(
-                        onClick = {
-                            if (isSelectionMode) {
-                                isSelectionMode = false
-                                selectedEncryptedNames = emptySet()
-                                autoScrollSpeedPx = 0f
-                            } else {
-                                isSelectionMode = true
-                            }
-                        },
-                        modifier = Modifier.testTag("choose_edit_button")
-                    ) {
-                        AnimatedContent(
-                            targetState = isSelectionMode,
-                            transitionSpec = {
-                                (fadeIn(tween(180)) + scaleIn(initialScale = 0.75f, animationSpec = spring(dampingRatio = 0.7f)))
-                                    .togetherWith(fadeOut(tween(140)) + scaleOut(targetScale = 0.75f, animationSpec = tween(140)))
-                            },
-                            label = "choose_edit_icon_anim"
-                        ) { selecting ->
-                            Icon(
-                                imageVector = if (selecting) Icons.Filled.Close else Icons.Filled.Edit,
-                                contentDescription = if (selecting) "Cancel Selection" else "Choose Items",
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    }
-                },
-                windowInsets = WindowInsets(0, 0, 0, 0),
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                    titleContentColor = MaterialTheme.colorScheme.onSurface
-                )
-            )
-        },
-        floatingActionButton = {
-            AnimatedVisibility(
-                visible = !isSelectionMode,
-                enter = scaleIn(animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium)) + fadeIn(tween(180)),
-                exit = scaleOut(animationSpec = tween(150)) + fadeOut(tween(150))
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.End,
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    AnimatedVisibility(
-                        visible = isImportMenuExpanded,
-                        enter = fadeIn(tween(180)) +
-                                slideInVertically(
-                                    initialOffsetY = { it / 2 },
-                                    animationSpec = spring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessMedium)
-                                ) +
-                                scaleIn(initialScale = 0.85f, animationSpec = tween(180)),
-                        exit = fadeOut(tween(130)) +
-                                slideOutVertically(targetOffsetY = { it / 2 }, animationSpec = tween(130)) +
-                                scaleOut(targetScale = 0.85f, animationSpec = tween(130))
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.End,
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Card(
-                                shape = RoundedCornerShape(14.dp),
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-                                modifier = Modifier
-                                    .border(
-                                        width = 1.dp,
-                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(14.dp)
-                                    )
-                                    .clickable {
-                                        isImportMenuExpanded = false
-                                        folderImportLauncher.launch(null)
-                                    }
-                                    .testTag("import_folder_button")
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
-                                ) {
-                                    Text(
-                                        text = "Import Folder",
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Icon(
-                                        imageVector = Icons.Filled.CreateNewFolder,
-                                        contentDescription = "Import Folder",
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
-                            }
-
-                            Card(
-                                shape = RoundedCornerShape(14.dp),
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
-                                modifier = Modifier
-                                    .border(
-                                        width = 1.dp,
-                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(14.dp)
-                                    )
-                                    .clickable {
-                                        isImportMenuExpanded = false
-                                        importLauncher.launch(arrayOf("image/*", "video/*"))
-                                    }
-                                    .testTag("import_files_button")
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
-                                ) {
-                                    Text(
-                                        text = "Select Files",
-                                        fontSize = 13.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Spacer(modifier = Modifier.width(10.dp))
-                                    Icon(
-                                        imageVector = Icons.Filled.AddPhotoAlternate,
-                                        contentDescription = "Select Files",
-                                        tint = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.size(20.dp)
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    val fabRotation by animateFloatAsState(
-                        targetValue = if (isImportMenuExpanded) 45f else 0f,
-                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
-                        label = "fab_icon_rotation"
-                    )
-                    FloatingActionButton(
-                        onClick = { isImportMenuExpanded = !isImportMenuExpanded },
-                        containerColor = MaterialTheme.colorScheme.primary,
-                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                        modifier = Modifier.testTag("import_fab")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Add,
-                            contentDescription = "Import Media Menu",
-                            modifier = Modifier.graphicsLayer {
-                                rotationZ = fabRotation
-                            }
-                        )
-                    }
-                }
-            }
-        },
-        modifier = modifier
+        containerColor = Color(0xFF000000),
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        modifier = modifier.background(Color(0xFF000000))
     ) { innerPadding ->
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .background(MaterialTheme.colorScheme.background)
+                .background(Color(0xFF000000))
         ) {
             AnimatedContent(
                 targetState = items.isEmpty() && !isLoading,
@@ -954,34 +1785,44 @@ fun GalleryScreen(
             ) { isEmptyState ->
                 if (isEmptyState) {
                     Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(32.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
+                        modifier = Modifier.fillMaxSize()
                     ) {
-                        Icon(
-                            imageVector = Icons.Filled.PhotoLibrary,
-                            contentDescription = "Empty Vault",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
-                            modifier = Modifier.size(72.dp)
+                        GalleryStatsHeader(
+                            totalFiles = items.size,
+                            photoCount = photoCount,
+                            videoCount = videoCount
                         )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "Your Secure Vault is Empty",
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Tap the '+' button below to import photos or videos from your device. All files will be encrypted block-by-block with zero local tracking database.",
-                            fontSize = 12.sp,
-                            lineHeight = 18.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.widthIn(max = 300.dp)
-                        )
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(32.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.PhotoLibrary,
+                                contentDescription = "Empty Vault",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.size(72.dp)
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "Your Secure Vault is Empty",
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Tap the '+' button below to import photos or videos from your device. All files will be encrypted block-by-block with zero local tracking database.",
+                                fontSize = 12.sp,
+                                lineHeight = 18.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.widthIn(max = 300.dp)
+                            )
+                        }
                     }
                 } else {
                     val groupedItems = remember(items) {
@@ -1101,12 +1942,32 @@ fun GalleryScreen(
                         columns = GridCells.Fixed(5),
                         modifier = Modifier
                             .fillMaxSize()
+                            .onGloballyPositioned { coords ->
+                                val pos = coords.positionInWindow()
+                                gridWindowX = pos.x
+                                gridWindowY = pos.y
+                                FloatingBarSharedState.gridStateRef = gridState
+                                FloatingBarSharedState.gridWindowX = pos.x
+                                FloatingBarSharedState.gridWindowY = pos.y
+                            }
                             .then(dragSelectModifier)
                             .testTag("gallery_grid"),
-                        contentPadding = PaddingValues(vertical = 1.dp),
+                        contentPadding = PaddingValues(top = 1.dp, bottom = 96.dp),
                         horizontalArrangement = Arrangement.spacedBy(1.dp),
                         verticalArrangement = Arrangement.spacedBy(1.dp)
                     ) {
+                        // Header thống kê nằm độc lập ở phía trên cùng của khu vực thumbnail
+                        item(
+                            key = "gallery_stats_header",
+                            span = { GridItemSpan(maxLineSpan) }
+                        ) {
+                            GalleryStatsHeader(
+                                totalFiles = items.size,
+                                photoCount = photoCount,
+                                videoCount = videoCount
+                            )
+                        }
+
                         groupedItems.forEach { (dateKey, itemsInGroup) ->
                             item(
                                 key = "header_$dateKey",
@@ -1128,7 +1989,6 @@ fun GalleryScreen(
                                     groupKeys.isNotEmpty() && selectedEncryptedNames.containsAll(groupKeys)
                                 }
 
-                                // Cố định chiều cao 24.dp cho dòng tiêu đề ngày để không bị layout shift khi hiện nút Select day
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -1240,7 +2100,15 @@ fun GalleryScreen(
                                         }
                                     },
                                     onPositioned = { bounds -> viewModel.updateThumbnailBounds(item.encryptedName, bounds) },
-                                    modifier = Modifier.animateItem()
+                                    modifier = Modifier.animateItem(),
+                                    dek = dek,
+                                    isOneShotLivePlaying = oneShotLiveItemKey == item.encryptedName,
+                                    onOneShotLiveFinished = {
+                                        if (oneShotLiveItemKey == item.encryptedName) {
+                                            oneShotLiveItemKey = null
+                                        }
+                                    },
+                                    oneShotTriggerId = oneShotLiveTriggerId
                                 )
                             }
                         }
@@ -1290,51 +2158,12 @@ fun GalleryScreen(
                 )
             }
 
-            if (showBulkExportDialog) {
-                val selectedItemsList = remember(items, selectedEncryptedNames) {
-                    items.filter { it.encryptedName in selectedEncryptedNames }
-                }
-                AlertDialog(
-                    onDismissRequest = { showBulkExportDialog = false },
-                    title = {
-                        Text(
-                            text = "Export ${selectedItemsList.size} Selected Media?",
-                            fontWeight = FontWeight.Bold
-                        )
-                    },
-                    text = {
-                        Text(
-                            text = "Decrypt and export ${selectedItemsList.size} original photo/video file(s) directly into this Vault folder?"
-                        )
-                    },
-                    confirmButton = {
-                        Button(
-                            onClick = {
-                                showBulkExportDialog = false
-                                val toExport = selectedItemsList
-                                viewModel.exportMultipleMedia(context, toExport) {
-                                    selectedEncryptedNames = emptySet()
-                                    isSelectionMode = false
-                                }
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-                            modifier = Modifier.testTag("confirm_bulk_export_button")
-                        ) {
-                            Text("EXPORT", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimary)
-                        }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = { showBulkExportDialog = false }) {
-                            Text("CANCEL")
-                        }
-                    }
-                )
-            }
-
+            // Lớp phủ mờ khi mở menu Import (+)
             AnimatedVisibility(
-                visible = isImportMenuExpanded,
-                enter = fadeIn(tween(150)),
-                exit = fadeOut(tween(120))
+                visible = isImportMenuExpanded && selectedMedia == null,
+                enter = fadeIn(floatingBarSpring()),
+                exit = fadeOut(floatingBarSpring()),
+                modifier = Modifier.zIndex(999f)
             ) {
                 Box(
                     modifier = Modifier
@@ -1349,11 +2178,221 @@ fun GalleryScreen(
                 )
             }
 
+            // Cụm menu Import (+) và Floating Bar luôn nằm ở lớp trên cùng (zIndex cao nhất) ở cạnh dưới màn hình
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .zIndex(1000f)
+                    .navigationBarsPadding()
+                    .padding(bottom = 12.dp)
+                    .graphicsLayer {
+                        alpha = if (selectedMedia != null) 0f else 1f
+                    }
+            ) {
+                AnimatedVisibility(
+                    visible = isImportMenuExpanded && floatingBarState == FloatingBarState.COLLAPSED,
+                    enter = fadeIn(floatingBarSpring()) +
+                            slideInVertically(
+                                initialOffsetY = { it / 2 },
+                                animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f)
+                            ) +
+                            scaleIn(initialScale = 0.85f, animationSpec = floatingBarSpring()),
+                    exit = fadeOut(floatingBarSpring()) +
+                            slideOutVertically(
+                                targetOffsetY = { it / 2 },
+                                animationSpec = spring(dampingRatio = 0.7f, stiffness = 300f)
+                            ) +
+                            scaleOut(targetScale = 0.85f, animationSpec = floatingBarSpring())
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Card(
+                            shape = RoundedCornerShape(14.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+                            modifier = Modifier
+                                .border(
+                                    width = 1.dp,
+                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                                .clickable {
+                                    isImportMenuExpanded = false
+                                    folderImportLauncher.launch(null)
+                                }
+                                .testTag("import_folder_button")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                            ) {
+                                Text(
+                                    text = "Import Folder",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Icon(
+                                    imageVector = Icons.Filled.CreateNewFolder,
+                                    contentDescription = "Import Folder",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+
+                        Card(
+                            shape = RoundedCornerShape(14.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp),
+                            modifier = Modifier
+                                .border(
+                                    width = 1.dp,
+                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(14.dp)
+                                )
+                                .clickable {
+                                    isImportMenuExpanded = false
+                                    importLauncher.launch(arrayOf("image/*", "video/*"))
+                                }
+                                .testTag("import_files_button")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+                            ) {
+                                Text(
+                                    text = "Select Files",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Icon(
+                                    imageVector = Icons.Filled.AddPhotoAlternate,
+                                    contentDescription = "Select Files",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                GalleryFloatingBar(
+                    barState = floatingBarState,
+                    onBarStateChange = { newState ->
+                        isImportMenuExpanded = false
+                        floatingBarState = newState
+                    },
+                    onConfirmDownload = {
+                        val targetItems = if (selectedEncryptedNames.isNotEmpty()) {
+                            items.filter { it.encryptedName in selectedEncryptedNames }
+                        } else {
+                            items
+                        }
+                        if (targetItems.isEmpty()) {
+                            floatingBarState = FloatingBarState.DOWNLOAD_COMPLETED
+                        } else {
+                            floatingBarState = FloatingBarState.DOWNLOADING
+                            viewModel.exportMultipleMedia(
+                                context = context,
+                                itemsToExport = targetItems,
+                                showOverlayLoading = false
+                            ) {
+                                floatingBarState = FloatingBarState.DOWNLOAD_COMPLETED
+                                selectedEncryptedNames = emptySet()
+                                isSelectionMode = false
+                            }
+                        }
+                    },
+                    onCancelDownload = {
+                        if (floatingBarState == FloatingBarState.DOWNLOADING || isExporting) {
+                            viewModel.cancelImport()
+                        }
+                        floatingBarState = FloatingBarState.COLLAPSED
+                    },
+                    onShowInFolder = {
+                        viewModel.openExportedFolder(context)
+                    },
+                    onLiveClick = {
+                        // Nhấn icon Live trên floating bar: phát nội dung Live đúng 1 lần duy nhất, không loop
+                        val candidateLive = items.firstOrNull {
+                            it.encryptedName in selectedEncryptedNames && it.isLivePhoto
+                        } ?: run {
+                            val visibleKeys = gridState.layoutInfo.visibleItemsInfo
+                                .mapNotNull { it.key as? String }
+                                .toSet()
+                            items.firstOrNull { it.encryptedName in visibleKeys && it.isLivePhoto }
+                                ?: items.firstOrNull { it.isLivePhoto }
+                        }
+                        if (candidateLive != null) {
+                            oneShotLiveItemKey = candidateLive.encryptedName
+                            oneShotLiveTriggerId++
+                        }
+                    },
+                    onAddClick = {
+                        isImportMenuExpanded = !isImportMenuExpanded
+                    },
+                    isAddMenuExpanded = isImportMenuExpanded,
+                    isViewerMode = false,
+                    isBarActive = selectedMedia == null,
+                    isSelectionMode = isSelectionMode,
+                    isFullVaultSelected = isFullVaultSelected,
+                    hasSelectedItems = selectedEncryptedNames.isNotEmpty(),
+                    downloadProgress = smoothImportProgress,
+                    onRefreshClick = {
+                        viewModel.loadVaultItems(context)
+                    },
+                    onToggleSelectAll = {
+                        selectedEncryptedNames = if (isFullVaultSelected) {
+                            emptySet()
+                        } else {
+                            orderedKeys.toSet()
+                        }
+                    },
+                    onDeleteClick = {
+                        showBulkDeleteDialog = true
+                    },
+                    onToggleSelectionMode = {
+                        if (isSelectionMode) {
+                            isSelectionMode = false
+                            selectedEncryptedNames = emptySet()
+                            autoScrollSpeedPx = 0f
+                        } else {
+                            isSelectionMode = true
+                        }
+                    },
+                    drawBackdrop = { barLeft, barTop ->
+                        val thumbVer = ThumbBitmapCache.version.intValue
+                        if (thumbVer >= 0) {
+                            drawGalleryGridBackdrop(
+                                barLeft = barLeft,
+                                barTop = barTop,
+                                gridState = gridState,
+                                gridWindowX = gridWindowX,
+                                gridWindowY = gridWindowY,
+                                boundsMap = boundsMap,
+                                excludeEncryptedName = animatingItem,
+                                alphaMultiplier = 1f
+                            )
+                        }
+                    }
+                )
+            }
+
             AnimatedVisibility(
                 visible = error != null,
                 enter = slideInVertically(initialOffsetY = { it }) + fadeIn(tween(200)),
                 exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(tween(160)),
-                modifier = Modifier.align(Alignment.BottomCenter)
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 72.dp)
             ) {
                 Snackbar(
                     modifier = Modifier.padding(16.dp),
@@ -1374,7 +2413,6 @@ fun GalleryScreen(
                 exit = fadeOut(animationSpec = tween(150))
             ) {
                 val realThumbSizeDp = with(density) { VaultViewModel.THUMB_SIZE_PX.toDp() }
-                // Khung viền tiến độ hình vuông bao sát quanh ô thumb 216x216 px (cách 6.dp mỗi cạnh)
                 val squareProgressBoxSizeDp = realThumbSizeDp + 12.dp
 
                 Box(
@@ -1404,7 +2442,6 @@ fun GalleryScreen(
                                 .widthIn(min = 240.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            // Đường tiến độ bao quanh hình vuông (chờ chạy đủ 100% + vẽ dấu tick trước khi ẩn)
                             SquareProgressBox(
                                 progress = if (isProcessCompleted) 1f else smoothImportProgress,
                                 isIndeterminate = (importProgress <= 0f && !isProcessCompleted) || isCancellingImport,
@@ -1415,7 +2452,6 @@ fun GalleryScreen(
                                 strokeWidth = 3.5.dp,
                                 cornerRadius = 10.dp
                             ) {
-                                // Hiệu ứng Fade In / Fade Out mượt mà khi đổi ảnh thumb của từng file đang mã hoá
                                 val thumbState = EncryptingThumbState(
                                     bitmap = currentImportThumb,
                                     isVideo = currentImportIsVideo,
@@ -1445,7 +2481,6 @@ fun GalleryScreen(
                                                 modifier = Modifier.fillMaxSize()
                                             )
 
-                                            // Giữ icon video hoặc Live Photo ở góc dưới bên phải của preview thumb khi đang mã hoá
                                             if (state.isVideo || state.isLivePhoto) {
                                                 Box(
                                                     modifier = Modifier
@@ -2093,9 +3128,14 @@ fun GalleryGridItem(
     isSelected: Boolean = false,
     onItemClick: (FloatArray?) -> Unit,
     onPositioned: (FloatArray) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    dek: ByteArray? = null,
+    isOneShotLivePlaying: Boolean = false,
+    onOneShotLiveFinished: () -> Unit = {},
+    oneShotTriggerId: Int = 0
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val itemBoundsRef = remember(item.encryptedName) { arrayOfNulls<FloatArray>(1) }
     var cachedThumb by remember(item.encryptedName) {
         mutableStateOf(ThumbBitmapCache.get(item.encryptedName))
@@ -2150,6 +3190,94 @@ fun GalleryGridItem(
         label = "grid_item_selected_corner"
     )
 
+    // Trạng thái nhấn giữ (hold) để loop Live Photo trên thumbnail vs nhấn nút Live (phát 1 lần)
+    var isHoldingLiveThumb by remember(item.encryptedName) { mutableStateOf(false) }
+    var isLiveThumbVideoRendered by remember(item.encryptedName) { mutableStateOf(false) }
+    var liveThumbVideoW by remember(item.encryptedName) { mutableIntStateOf(0) }
+    var liveThumbVideoH by remember(item.encryptedName) { mutableIntStateOf(0) }
+    var liveThumbPlayer by remember(item.encryptedName) { mutableStateOf<ExoPlayer?>(null) }
+
+    val currentOnOneShotFinished by rememberUpdatedState(onOneShotLiveFinished)
+    val shouldPlayLiveThumb = item.isLivePhoto && dek != null && (isHoldingLiveThumb || isOneShotLivePlaying)
+
+    LaunchedEffect(isSelectionMode) {
+        if (isSelectionMode && isHoldingLiveThumb) {
+            isHoldingLiveThumb = false
+        }
+    }
+
+    LaunchedEffect(shouldPlayLiveThumb, isHoldingLiveThumb, isOneShotLivePlaying, oneShotTriggerId, dek) {
+        val key = dek
+        if (item.isLivePhoto && key != null && (isHoldingLiveThumb || isOneShotLivePlaying)) {
+            val loopMode = if (isHoldingLiveThumb) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+            if (liveThumbPlayer == null) {
+                val liveUri = item.uri.buildUpon().appendQueryParameter("live", "1").build()
+                liveThumbPlayer = ExoPlayer.Builder(context).build().apply {
+                    val mediaSource = ProgressiveMediaSource.Factory(
+                        EncryptedDataSourceFactory(context, key)
+                    ).createMediaSource(MediaItem.fromUri(liveUri))
+                    setMediaSource(mediaSource)
+                    repeatMode = loopMode
+                    volume = 0f
+                    prepare()
+                    addListener(object : Player.Listener {
+                        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                            if (videoSize.width > 0 && videoSize.height > 0) {
+                                liveThumbVideoW = (videoSize.width * videoSize.pixelWidthHeightRatio).toInt()
+                                liveThumbVideoH = videoSize.height
+                            }
+                        }
+
+                        override fun onRenderedFirstFrame() {
+                            isLiveThumbVideoRendered = true
+                        }
+
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            if (playbackState == Player.STATE_ENDED && repeatMode == Player.REPEAT_MODE_OFF) {
+                                isLiveThumbVideoRendered = false
+                                currentOnOneShotFinished()
+                            }
+                        }
+                    })
+                }
+            } else {
+                liveThumbPlayer?.repeatMode = loopMode
+                liveThumbPlayer?.seekTo(0L)
+            }
+            liveThumbPlayer?.playWhenReady = true
+            liveThumbPlayer?.play()
+        } else {
+            isLiveThumbVideoRendered = false
+            liveThumbPlayer?.let { player ->
+                player.playWhenReady = false
+                player.stop()
+                player.clearVideoSurface()
+                player.release()
+            }
+            liveThumbPlayer = null
+        }
+    }
+
+    DisposableEffect(item.encryptedName) {
+        onDispose {
+            isHoldingLiveThumb = false
+            isLiveThumbVideoRendered = false
+            liveThumbPlayer?.let { player ->
+                player.playWhenReady = false
+                player.stop()
+                player.clearVideoSurface()
+                player.release()
+            }
+            liveThumbPlayer = null
+        }
+    }
+
+    val liveThumbAlpha by animateFloatAsState(
+        targetValue = if (shouldPlayLiveThumb && isLiveThumbVideoRendered) 1f else 0f,
+        animationSpec = tween(durationMillis = 160),
+        label = "live_thumb_video_alpha"
+    )
+
     LaunchedEffect(item.encryptedName, painterState) {
         val successState = painterState as? coil.compose.AsyncImagePainter.State.Success ?: return@LaunchedEffect
         val bmp = (successState.result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap ?: return@LaunchedEffect
@@ -2169,6 +3297,8 @@ fun GalleryGridItem(
             }
         }
     }
+
+    val currentOnItemClick by rememberUpdatedState(onItemClick)
 
     Box(
         modifier = modifier
@@ -2201,8 +3331,54 @@ fun GalleryGridItem(
                     onPositioned(bounds)
                 }
             }
-            .clickable {
-                onItemClick(itemBoundsRef[0])
+            .pointerInput(item.encryptedName, item.isLivePhoto, isSelectionMode, dek != null) {
+                val touchSlop = viewConfiguration.touchSlop
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val startPos = down.position
+                    var movedTooFar = false
+                    var holdActivated = false
+                    var releasedNormally = false
+
+                    val holdJob: Job? = if (item.isLivePhoto && !isSelectionMode && dek != null) {
+                        coroutineScope.launch {
+                            delay(240L)
+                            if (!movedTooFar) {
+                                holdActivated = true
+                                isHoldingLiveThumb = true
+                            }
+                        }
+                    } else null
+
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val changes = event.changes
+                            if (changes.isEmpty() || changes.all { !it.pressed }) {
+                                releasedNormally = true
+                                break
+                            }
+                            val activeChange = changes.firstOrNull { it.id == down.id } ?: changes.first()
+                            val dist = (activeChange.position - startPos).getDistance()
+                            if (!holdActivated) {
+                                if (activeChange.isConsumed || dist > touchSlop) {
+                                    movedTooFar = true
+                                    holdJob?.cancel()
+                                    break
+                                }
+                            } else {
+                                activeChange.consume()
+                            }
+                        }
+                    } finally {
+                        holdJob?.cancel()
+                        isHoldingLiveThumb = false
+                    }
+
+                    if (releasedNormally && !holdActivated && !movedTooFar) {
+                        currentOnItemClick(itemBoundsRef[0])
+                    }
+                }
             }
             .testTag("grid_item_${item.encryptedName}")
     ) {
@@ -2251,6 +3427,32 @@ fun GalleryGridItem(
                     modifier = Modifier
                         .fillMaxSize()
                         .graphicsLayer { alpha = imageLoadedAlpha }
+                )
+            }
+
+            if (item.isLivePhoto && (shouldPlayLiveThumb || liveThumbAlpha > 0.01f) && liveThumbPlayer != null) {
+                val effW = if (liveThumbVideoW > 0) liveThumbVideoW else intrinsicWidth.toInt()
+                val effH = if (liveThumbVideoH > 0) liveThumbVideoH else intrinsicHeight.toInt()
+                AndroidView(
+                    factory = { ctx ->
+                        TextureView(ctx).apply {
+                            isOpaque = false
+                            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                                applyCenterCropMatrix(this, effW, effH)
+                            }
+                            liveThumbPlayer?.setVideoTextureView(this)
+                        }
+                    },
+                    update = { textureView ->
+                        liveThumbPlayer?.setVideoTextureView(textureView)
+                        applyCenterCropMatrix(textureView, effW, effH)
+                    },
+                    onRelease = { textureView ->
+                        liveThumbPlayer?.clearVideoTextureView(textureView)
+                    },
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer { alpha = liveThumbAlpha }
                 )
             }
         }
@@ -2319,6 +3521,29 @@ fun GalleryGridItem(
             }
         }
     }
+}
+
+private fun applyCenterCropMatrix(textureView: TextureView, videoW: Int, videoH: Int) {
+    val viewW = textureView.width.toFloat()
+    val viewH = textureView.height.toFloat()
+    if (viewW <= 0f || viewH <= 0f || videoW <= 0 || videoH <= 0) return
+
+    val videoAspect = videoW.toFloat() / videoH.toFloat()
+    val viewAspect = viewW / viewH
+
+    val scaleX: Float
+    val scaleY: Float
+    if (videoAspect > viewAspect) {
+        scaleX = videoAspect / viewAspect
+        scaleY = 1f
+    } else {
+        scaleX = 1f
+        scaleY = viewAspect / videoAspect
+    }
+
+    val matrix = android.graphics.Matrix()
+    matrix.setScale(scaleX, scaleY, viewW / 2f, viewH / 2f)
+    textureView.setTransform(matrix)
 }
 
 private fun formatGroupDate(timestamp: Long): String {

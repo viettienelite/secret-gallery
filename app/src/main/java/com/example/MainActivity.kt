@@ -101,7 +101,11 @@ class MainActivity : ComponentActivity() {
                                 modifier = screenModifier
                             )
                         } else {
-                            Box(modifier = Modifier.fillMaxSize()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(androidx.compose.ui.graphics.Color(0xFF000000))
+                            ) {
                                 GalleryScreen(
                                     viewModel = vaultViewModel,
                                     modifier = screenModifier
